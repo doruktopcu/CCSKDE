@@ -1,0 +1,453 @@
+% =============================================================================
+% Progress Report — Context-Conditioned Sequential Keypoint Density Estimation
+% Doruk Topcu (N25142281), Hacettepe University
+%
+% Template: ICLR 2025 Conference Submission
+%   https://www.overleaf.com/latex/templates/template-for-iclr-2025-conference-submission/g9zkdyycxtvt
+%
+% To compile locally, place the following files from the Overleaf template
+% in this directory:  iclr2025_conference.sty, fancyhdr.sty (system-provided),
+% natbib.sty (system-provided), math_commands.tex (optional).
+% Then:  pdflatex main && bibtex main && pdflatex main && pdflatex main
+% =============================================================================
+\documentclass{article}
+\usepackage{iclr2025_conference,times}
+
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{xcolor}
+
+\title{Context-Conditioned Sequential Keypoint Density Estimation\\
+       for Traffic Hazard Detection \\ \vspace{0.4em}
+       {\large Progress Report}}
+
+\author{Doruk Topcu \\
+        Department of Computer Engineering \\
+        Hacettepe University \\
+        \texttt{doruktopcu@hacettepe.edu.tr} \\
+        \texttt{N25142281}}
+
+\iclrfinalcopy
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+The Sequential Keypoint Density Estimator (SeeKer / SKDE) is a recent
+ICCV~2025 baseline for skeleton-based video anomaly detection that models the
+joint density of a pedestrian's 2D keypoint trajectory through an autoregressive
+factorization. Despite its simplicity, SeeKer matches or surpasses much heavier
+graph-convolutional and diffusion-based competitors. However, it is
+\emph{environmentally blind}: each skeleton is treated in complete isolation
+from the surrounding scene. In real-world surveillance --- and especially in
+traffic-hazard scenarios --- a pedestrian's motion is rarely abnormal in
+absolute terms; it is the \emph{interaction} with vehicles, bicycles, or
+restricted zones that defines the hazard. We propose
+\textbf{CCSKDE} (Context-Conditioned SKDE), an extension that injects a
+lightweight environmental context vector $C_t$ --- derived from off-the-shelf
+YOLOv11 detections of non-pedestrian scene elements --- directly into the
+autoregressive factorization. We evaluate on the ShanghaiTech Campus dataset,
+which natively contains pedestrian--vehicle interactions. This document
+reports our problem framing, related work, the proposed method, the
+experimental protocol, and preliminary results from reproducing the
+SeeKer baseline.
+\end{abstract}
+
+% -----------------------------------------------------------------------------
+\section{Problem Definition}
+\label{sec:problem}
+
+Video anomaly detection (VAD) is the task of identifying frames or events in a
+video stream whose appearance, motion, or interaction patterns deviate
+significantly from those observed in a training set of \emph{normal} videos.
+Modern VAD pipelines increasingly operate not on raw RGB pixels but on
+intermediate, privacy-preserving representations such as 2D human skeletons
+extracted by an off-the-shelf pose estimator. Skeleton-based VAD has three
+practical advantages: (i)~the input is much lower-dimensional than RGB,
+(ii)~models become invariant to appearance and lighting biases that often
+plague RGB-based detectors, and (iii)~no facial or identifying pixels are
+retained, which is desirable for surveillance applications.
+
+Within this family, the \emph{Sequential Keypoint Density Estimator}
+(SKDE / SeeKer) of \citet{delic2025seeker} is a particularly elegant baseline.
+It treats a pedestrian's pose trajectory as a high-dimensional time series and
+estimates its joint density via an autoregressive factorization at the
+keypoint level: each individual 2D keypoint is predicted as a Gaussian
+conditioned on all previously generated keypoints in the same and earlier
+frames. Anomalies are detected by ranking observed test sequences by their
+log-likelihood under the model. Despite using only a small masked
+fully-connected (MADE) network~\citep{germain2015made}, SeeKer matches or
+exceeds heavier flow-based and graph-based competitors on standard
+benchmarks~\citep{hirschorn2023normalizing,liu2018future}.
+
+\paragraph{Limitation we address.}
+SeeKer's autoregressive distribution is conditioned only on the pedestrian's
+own past keypoints; it never observes \emph{what else is in the scene}. This
+is a fundamental information bottleneck: a pedestrian walking at a constant
+velocity in a calm campus square and the same pedestrian walking at the same
+velocity directly into the path of a moving vehicle yield identical SeeKer
+likelihoods. In surveillance, however, the latter is precisely the event we
+need to flag. The aim of this project is to extend SeeKer with a minimal,
+mathematically faithful conditioning mechanism on a per-frame
+\emph{environmental context vector} $C_t$, so that the predicted keypoint
+distribution can sharpen (smaller covariance) when the pedestrian is in a
+high-risk spatial configuration.
+
+\paragraph{Challenges.}
+The problem is non-trivial for four reasons. (i)~\textbf{Unsupervised
+conditioning}: VAD is one-class, so we must learn what contextual
+configurations are normal without any hazard labels. (ii)~\textbf{Preserving
+the autoregressive factorization}: naively concatenating $C_t$ to MADE's
+input breaks the carefully designed keypoint mask, so the conditioning must
+be injected as an unconditional shortcut while the keypoint-to-keypoint
+causality is left intact. (iii)~\textbf{Generalization across scenes}:
+ShanghaiTech contains $13$ different camera viewpoints, so $C_t$ must be a
+scene-scale-invariant function of pedestrian--object geometry rather than
+absolute image coordinates. (iv)~\textbf{Compute envelope}: the project must
+run in a single-semester timeline on commodity hardware (Apple Silicon MPS
+in our case), ruling out heavy dynamic-graph or transformer backbones. We
+note that ShanghaiTech is the only widely-used VAD benchmark with mixed
+pedestrian/vehicle interactions; UBnormal~\citep{acsintoae2022ubnormal} is
+fully synthetic, so our context contribution is evaluated primarily on
+ShanghaiTech.
+
+% -----------------------------------------------------------------------------
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Skeleton-based video anomaly detection.}
+Pose-based approaches have become the dominant paradigm for VAD on
+person-centric datasets, since they sidestep RGB-level confounders.
+\citet{morais2019messagepassing} introduced one of the first
+skeleton-only VAD pipelines using a recurrent message-passing network.
+\citet{markovitz2020graph} cast normal motion modeling as soft-clustering of
+spatio-temporal graph embeddings. STG-NF~\citep{hirschorn2023normalizing}
+fits a normalizing flow over spatio-temporal graphs of joints and was the
+state of the art on ShanghaiTech-HR until SeeKer.
+SeeKer~\citep{delic2025seeker} departs from these heavier architectures and
+demonstrates that an autoregressive masked fully-connected network is in
+fact a strong --- and previously overlooked --- baseline. Our work builds
+directly on SeeKer.
+
+\paragraph{Density estimation backbones.}
+SeeKer's core is MADE~\citep{germain2015made}, a masked fully-connected
+autoencoder that performs autoregressive density estimation in a single
+forward pass. Related neural density estimators
+(RealNVP~\citep{dinh2017realnvp}, Glow~\citep{kingma2018glow}) require
+multiple coupling layers but produce exact log-likelihoods; STG-NF exploits
+this for VAD scoring. SeeKer shows the simpler masked-FC formulation is
+sufficient and substantially cheaper.
+
+\paragraph{Context-aware anomaly detection.}
+A separate strand of VAD literature explicitly injects scene/object
+information into the anomaly scorer.
+\citet{ionescu2019object} score per-object appearance and motion features
+using one-class SVMs, and \citet{georgescu2021background} use background-aware
+self-supervised pretexts. The HSC~\citep{sun2023hierarchical} and
+SSMTL++~\citep{georgescu2022ssmtl} frameworks combine multiple
+self-supervised signals including object-level cues. To our knowledge,
+no prior work has injected an explicit, per-frame proximity-to-non-pedestrian
+context vector into an autoregressive keypoint density estimator; this is
+the gap our work addresses.
+
+\paragraph{Object detection, datasets and pose extraction.}
+We use YOLOv11~\citep{ultralytics2024yolov11} for one-time offline detection
+of non-pedestrian scene elements; its bounding boxes are aggregated into
+$C_t$ as described in Section~\ref{ssec:ccskde}. ShanghaiTech
+Campus~\citep{liu2018future} comprises 13 outdoor scenes, 437 videos, and a
+mixture of pedestrian, bicycle, and vehicle activity; anomalies (bicycle
+riding in pedestrian zones, unauthorized vehicles, etc.) are typically
+defined by a pedestrian--object interaction, making it the natural benchmark
+for our hypothesis. All skeletons are AlphaPose~\citep{fang2017rmpe}
+COCO-17 keypoints converted to COCO-18 (synthetic neck) following SeeKer's
+preprocessing; we use the publicly released pose JSONs from STG-NF for full
+reproducibility.
+
+% -----------------------------------------------------------------------------
+\section{Method}
+\label{sec:method}
+
+\subsection{Baseline: SeeKer in detail}
+\label{ssec:baseline}
+
+Let a pedestrian track be a sequence of $T$ frames, each containing $V=18$
+COCO-18 2D keypoints. We denote an individual coordinate by
+$X_{t,n} \in \mathbb{R}^{2}$, the $n$-th keypoint of frame $t$, with
+$n \in \{1,\dots,V\}$. Let $X_{<t}$ denote all keypoints from frames before
+$t$, and $X_{t,<n}$ all keypoints of frame $t$ with index strictly less than
+$n$. SeeKer factorizes the joint density of the entire track as
+
+\begin{equation}
+\label{eq:seeker_factor}
+p_{\theta}\!\left(X_{1:T}\right) \;=\;
+\prod_{t=1}^{T} \prod_{n=1}^{V}
+p_{\theta}\!\left(X_{t,n}\,\big|\, X_{t,<n},\, X_{<t}\right).
+\end{equation}
+
+Each conditional is parameterized as a 2D Gaussian
+$\mathcal{N}\!\left(\mu_{\theta},\, \Sigma_{\theta}\right)$ whose mean and
+covariance are produced by a single masked fully-connected network
+(\emph{MADEPartial}). To guarantee positive-definite covariances, the
+network outputs the entries of the Cholesky factor
+$L_{\theta} \in \mathbb{R}^{2 \times 2}$ such that
+$\Sigma_{\theta}^{-1} = L_{\theta} L_{\theta}^{\!\top}$. The
+keypoint-level autoregressive constraint is enforced by binary masks on the
+weight matrices, exactly as in MADE~\citep{germain2015made}; SeeKer adapts
+the masking so that conditioning is causal both \emph{across} time and
+\emph{within} the keypoint ordering of the current frame.
+
+\paragraph{Training.} The model is trained on \emph{normal} pedestrian
+sequences only, by minimizing the negative log-likelihood of
+Equation~\ref{eq:seeker_factor}.
+
+\paragraph{Anomaly scoring.} At inference, each test frame receives a
+per-keypoint negative log-likelihood. SeeKer aggregates these into a
+frame-level anomaly score (optionally weighted by AlphaPose detection
+confidence), then applies temporal Gaussian smoothing.
+The resulting score is the Mahalanobis distance under the predicted
+$\Sigma_{\theta}$: when the network is confident (small $\Sigma_{\theta}$)
+and the observation deviates from $\mu_{\theta}$, the score is large.
+
+\subsection{Proposed extension: CCSKDE}
+\label{ssec:ccskde}
+
+Our contribution is to make the predicted distribution
+\emph{context-aware}, by introducing a per-frame context vector $C_t$:
+
+\begin{equation}
+\label{eq:ccskde_factor}
+p_{\theta}\!\left(X_{t,n}\,\big|\, X_{t,<n},\, X_{<t},\, C_t\right).
+\end{equation}
+
+\paragraph{Constructing $C_t$.}
+For each frame $t$ in the training and test videos, we run YOLOv11 on the raw
+RGB frame and retain only detections of non-pedestrian classes that are
+plausible hazards on a campus: \texttt{car}, \texttt{truck}, \texttt{bus},
+\texttt{motorcycle}, \texttt{bicycle}. For each such detection $b$, with
+bounding-box centre $(x_b, y_b)$, we compute its image-space distance to the
+target pedestrian's skeleton centroid $\bar{x}_t$:
+\(
+d_{t,b} = \lVert (x_b, y_b) - \bar{x}_t \rVert_2 / \sqrt{H^2 + W^2}\,,
+\)
+normalized by the image diagonal so the quantity is scene-scale-independent.
+We aggregate to a fixed-dimension vector by taking, per class,
+the inverse minimum distance and the count of objects within a fixed radius:
+
+\begin{equation}
+C_t \;=\; \big[\,1/d^{\min}_{c_1},\,n^{\le r}_{c_1},\,
+                 1/d^{\min}_{c_2},\,n^{\le r}_{c_2},\,\dots\,\big]
+\;\in\;\mathbb{R}^{2K},
+\end{equation}
+where $K$ is the number of hazard classes. Frames with no relevant
+detection receive an all-zero vector. This design has three properties we
+care about: (i)~it is fixed-dimension regardless of how many objects are in
+the scene, (ii)~its magnitude grows monotonically with proximity to a
+hazard, and (iii)~it is computed once offline, so it adds no train-time
+inference cost on the YOLO side.
+
+\paragraph{Injection into the autoregressive backbone.}
+Naively concatenating $C_t$ to the MADE input would interfere with the
+keypoint mask. We instead treat $C_t$ as an \emph{unconditional shortcut
+input}: its entries are appended to the input vector and assigned a
+constant ``zero-degree'' label in MADE's connectivity scheme. This
+construction guarantees that every output neuron may attend to every entry
+of $C_t$, while the existing keypoint-to-keypoint causality is preserved.
+Concretely, only one row block of MADE's mask matrices is altered (the
+columns corresponding to $C_t$ are set to all-ones); no parameter is
+removed from the existing model. A diagram of the modified architecture
+will accompany the final report.
+
+\paragraph{Effect on the predicted distribution.}
+Because both $\mu_{\theta}$ and $L_{\theta}$ become functions of $C_t$, the
+network can in principle learn two complementary effects: (a)~shift the
+predicted mean to anticipate, e.g., evasive sidestepping near a vehicle
+during normal training behavior, and (b)~shrink the predicted covariance in
+high-context regions, since fewer kinematic outcomes are normal there.
+Mechanism~(b) is the one we particularly care about for hazard detection:
+under a shrunken $\Sigma_{\theta}$, even a small kinematic deviation
+from $\mu_{\theta}$ produces a large Mahalanobis score, exactly when we
+want the detector to fire. Our ablation will isolate this effect.
+
+\subsection{Training and evaluation protocol}
+\label{ssec:protocol}
+We pre-extract $C_t$ for every frame of ShanghaiTech once, offline, and
+cache the result as \texttt{.npy} tensors keyed by \texttt{<scene>\_<clip>}.
+CCSKDE is then trained on normal training sequences with the same NLL
+objective as SeeKer, with the only change being the augmented input. At
+test time, scoring is unchanged: per-keypoint NLL, Gaussian-smoothed,
+confidence-weighted. We compare frame-level AUROC and AP against the
+vanilla SeeKer baseline trained on the identical pose data, and report a
+``shuffled-context'' negative control that permutes $C_t$ across frames
+at training time --- this verifies any gains arise from the spatio-temporal
+alignment of $C_t$ rather than from extra parameters.
+
+% -----------------------------------------------------------------------------
+\section{Experimental Settings and Preliminary Results}
+\label{sec:experiments}
+
+\subsection{Dataset}
+We use the ShanghaiTech Campus dataset~\citep{liu2018future}: 13 outdoor
+scenes, 330~normal training videos and 107~test videos containing 130
+labelled abnormal events. Anomalies include riding bicycles or driving
+vehicles in pedestrian areas --- precisely the type of context-dependent
+hazard our method targets. Pose data are the AlphaPose-tracked
+JSONs released with STG-NF~\citep{hirschorn2023normalizing}, which match
+the format expected by SeeKer. Frame-level ground-truth masks are
+distributed alongside.
+
+\subsection{Implementation environment}
+All experiments are run in a Python~3.12 virtual environment with
+PyTorch~2.11.0 on the Apple Silicon MPS backend. Object detection uses
+the Ultralytics package (v8.4.46) with YOLOv11. The codebase is organized
+as follows:
+
+\begin{itemize}
+    \item \texttt{seeker/} --- a vendored, read-only clone of the official
+    SeeKer release~\citep{delic2025seeker} (\url{github.com/adelic99/seeker}),
+    licensed MIT.
+    \item \texttt{ccskde/} --- our extension package, containing the
+    context-extraction pipeline (\texttt{ccskde.context}), the
+    context-conditioned MADE variant (\texttt{ccskde.models}), and dataset
+    wrappers that pair pose tensors with $C_t$ (\texttt{ccskde.data}).
+    \item \texttt{scripts/} --- launchers for baseline reproduction and
+    CCSKDE ablation runs.
+\end{itemize}
+
+We applied a small set of unavoidable portability patches to the upstream
+\texttt{seeker/} package (five hardcoded \texttt{`cuda'} references replaced
+with the device-agnostic \texttt{args.device}; one upstream attribute typo,
+\texttt{args.dropout} vs.\ the registered \texttt{args.droppout}, fixed
+along the way). No model-level edits were made to the baseline.
+
+\subsection{Hyperparameters}
+For baseline reproduction we follow the SeeKer paper's published settings
+on ShanghaiTech: segment length $T=24$ frames, segment stride $1$,
+batch size $1024$ (reduced to $256$ for our preliminary smoke run on MPS),
+$10$ training epochs, Adam optimizer with learning rate $5\times10^{-4}$,
+single-layer MADEPartial with expansion factor $1$. Anomaly scores are
+smoothed temporally with a Gaussian filter of $\sigma$ matched to the
+paper's choice. For CCSKDE the hyperparameters are inherited unchanged;
+only the input dimension grows by $|C_t| = 2K$.
+
+\subsection{Evaluation metrics}
+We report frame-level Area Under the ROC curve (AUROC) and Average
+Precision (AP), the two standard metrics for VAD on ShanghaiTech. The
+SeeKer paper reports a frame-level AUROC of $85.5\%$ on ShanghaiTech;
+this is our primary reproduction target and the baseline against which any
+gain from $C_t$ will be measured.
+
+\subsection{Preliminary results}
+At the time of this progress report we have verified the end-to-end
+pipeline and produced a first preliminary number. The vendored SeeKer
+codebase is patched for device portability and successfully constructs the
+ShanghaiTech pose dataset on MPS hardware (full $437$-video pose split
+processed in $\approx 3.5$ minutes, producing the expected
+$(N, C{=}3, T{=}24, V{=}18)$ tensor). A one-epoch training run with
+\texttt{batch\_size=256} on Apple Silicon MPS completes the full
+forward/backward pass through MADEPartial, runs the temporal
+Gaussian-smoothed evaluation, and reports
+\textbf{AUROC = $0.744$, Average Precision = $0.647$}, with FPR@95
+$= 0.685$. The paper reports $0.855$ AUROC at $10$ epochs / batch
+$1024$ on CUDA, so $0.744$ after a single epoch on MPS is consistent
+with a healthy training trajectory; the loss decreases from $\sim\!21$
+at epoch start into the negative regime expected of a Gaussian
+log-density. End-to-end wall-clock is $\approx 20$~minutes per epoch
+on this hardware, so the full $10$-epoch reproduction targeting
+$0.855$ AUROC is tractable in a single training session.
+
+Sibling package \texttt{ccskde/} is scaffolded with stubs for context
+extraction, context-conditioned model variants, and pose+context dataset
+wrappers; the YOLOv11-based $C_t$ pass will run as a one-off preprocessing
+step once baseline reproduction is confirmed. The final report will
+include the reproduced baseline, the CCSKDE result, the
+with/without-$C_t$ ablation, and the shuffled-context negative control
+described in Section~\ref{ssec:protocol}.
+
+% -----------------------------------------------------------------------------
+\bibliographystyle{iclr2025_conference}
+\begin{thebibliography}{99}
+
+\bibitem[Acsintoae et~al.(2022)]{acsintoae2022ubnormal}
+Acsintoae, A., Florescu, A., Georgescu, M.-I., Mare, T., Sumedrea, P.,
+Ionescu, R.~T., Khan, F.~S., \& Shah, M. (2022).
+\newblock UBnormal: New Benchmark for Supervised Open-Set Video Anomaly Detection.
+In {\em CVPR}.
+
+\bibitem[Deli{\'c} et~al.(2025)]{delic2025seeker}
+Deli{\'c}, A., Gr{\v c}i{\'c}, M., \& {\v S}egvi{\'c}, S. (2025).
+\newblock Sequential Keypoint Density Estimator: An Overlooked Baseline of
+Skeleton-Based Video Anomaly Detection.
+\newblock In {\em ICCV} (Highlight).
+
+\bibitem[Dinh et~al.(2017)]{dinh2017realnvp}
+Dinh, L., Sohl-Dickstein, J., \& Bengio, S. (2017). Density Estimation Using Real NVP. In {\em ICLR}.
+
+\bibitem[Fang et~al.(2017)]{fang2017rmpe}
+Fang, H.-S., Xie, S., Tai, Y.-W., \& Lu, C. (2017).
+\newblock RMPE: Regional Multi-Person Pose Estimation.
+In {\em ICCV}.
+
+\bibitem[Georgescu et~al.(2021)]{georgescu2021background}
+Georgescu, M.-I., Barbalau, A., Ionescu, R.~T., Khan, F.~S., Popescu, M., \&
+Shah, M. (2021).
+\newblock Anomaly Detection in Video via Self-Supervised and Multi-Task Learning.
+In {\em CVPR}.
+
+\bibitem[Georgescu et~al.(2022)]{georgescu2022ssmtl}
+Georgescu, M.-I., Ionescu, R.~T., Khan, F.~S., Popescu, M., \& Shah, M. (2022).
+\newblock A Background-Agnostic Framework with Adversarial Training for Abnormal Event Detection in Video.
+{\em IEEE TPAMI}.
+
+\bibitem[Germain et~al.(2015)]{germain2015made}
+Germain, M., Gregor, K., Murray, I., \& Larochelle, H. (2015).
+\newblock MADE: Masked Autoencoder for Distribution Estimation.
+In {\em ICML}.
+
+\bibitem[Hirschorn \& Avidan(2023)]{hirschorn2023normalizing}
+Hirschorn, O., \& Avidan, S. (2023).
+\newblock Normalizing Flows for Human Pose Anomaly Detection.
+In {\em ICCV}.
+
+\bibitem[Ionescu et~al.(2019)]{ionescu2019object}
+Ionescu, R.~T., Khan, F.~S., Georgescu, M.-I., \& Shao, L. (2019).
+\newblock Object-Centric Auto-Encoders and Dummy Anomalies for Abnormal
+Event Detection in Video.
+In {\em CVPR}.
+
+\bibitem[Kingma \& Dhariwal(2018)]{kingma2018glow}
+Kingma, D.~P., \& Dhariwal, P. (2018).
+\newblock Glow: Generative Flow with Invertible $1{\times}1$ Convolutions.
+In {\em NeurIPS}.
+
+\bibitem[Liu et~al.(2018)]{liu2018future}
+Liu, W., Luo, W., Lian, D., \& Gao, S. (2018).
+\newblock Future Frame Prediction for Anomaly Detection -- A New Baseline.
+In {\em CVPR}.
+
+\bibitem[Markovitz et~al.(2020)]{markovitz2020graph}
+Markovitz, A., Sharir, G., Friedman, I., Zelnik-Manor, L., \& Avidan, S. (2020).
+\newblock Graph Embedded Pose Clustering for Anomaly Detection.
+In {\em CVPR}.
+
+\bibitem[Morais et~al.(2019)]{morais2019messagepassing}
+Morais, R., Le, V., Tran, T., Saha, B., Mansour, M., \& Venkatesh, S. (2019).
+\newblock Learning Regularity in Skeleton Trajectories for Anomaly Detection
+in Videos.
+In {\em CVPR}.
+
+\bibitem[Sun \& Gong(2023)]{sun2023hierarchical}
+Sun, S., \& Gong, X. (2023).
+\newblock Hierarchical Semantic Contrast for Scene-Aware Video Anomaly Detection.
+In {\em CVPR}.
+
+\bibitem[Ultralytics(2024)]{ultralytics2024yolov11}
+Ultralytics. (2024).
+\newblock YOLOv11.
+\newblock \url{https://github.com/ultralytics/ultralytics}.
+
+\end{thebibliography}
+
+\end{document}
