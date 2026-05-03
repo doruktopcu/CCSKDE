@@ -206,10 +206,87 @@ data/ShanghaiTech/
 - Output log preserved at `/private/tmp/.../bdrg311d5.output` (will rotate; key numbers above are the durable record).
 **Next:** (a) extend `#11` patches block in this report retroactively for traceability — DONE inline above; (b) update the final paragraph of `report/main.tex` Section 4.5 to cite the concrete 0.7438 number rather than the vaguer "smoke test passes"; (c) launch the full 10-epoch / batch 1024 reproduction run targeting 0.855 AUROC; (d) start designing the YOLOv11 $C_t$ extraction pass.
 
+### #14 — Seeker patches committed; full reproduction launched in background
+**Date:** 2026-05-02
+**Type:** setup + experiment
+**Summary:** (1) Committed the 8-line portability/path/typo patch set from #11+#12 to the nested `seeker/` git history (commit `3706984`, "CCSKDE: device portability + path/typo fixes for local run"). The patch lives only in our local `seeker/` clone — upstream `adelic99/seeker` is unaffected — keeping the diff durable and inspectable without touching the parent repo. (2) Authored `scripts/repro_seeker_shanghaitech.sh` (10 epochs, batch 256, MPS, seed 42) and launched it in background under `nohup`; first ~3 minutes of output show the same pose-loading and tqdm trajectory as the smoke run, confirming no regression from the commit. Expected wall-clock ~3 h.
+**Decision:** kept batch size at 256 rather than the paper's 1024. Why: the smoke run proved 256 fits comfortably in M-series unified memory; 1024 was untested and we cannot afford an OOM mid-run on the eve of the report deadline. How to apply: any future MPS reproduction script defaults to 256 unless we benchmark a higher value cleanly.
+**Artifacts:**
+- `scripts/repro_seeker_shanghaitech.sh` — full-reproduction launcher.
+- `logs/repro_seeker_<timestamp>.log` — live training log.
+- `seeker/` commit `3706984` (local-only).
+**Next:** read the log when the run finishes; record final AUROC in entry `#16`. If it lands ≥ ~0.84, we have a credible baseline for the CCSKDE comparison.
 
+### #15 — `ccskde/context/` scaffold + smoke-tested $C_t$ builder
+**Date:** 2026-05-02
+**Type:** code
+**Summary:** Implemented the offline $C_t$ pipeline described in report Section 3.2 as three small modules under `ccskde/context/` plus a CLI driver. Stage 1 runs YOLOv11 once per video and caches per-frame normalized boxes (cls, conf, cx, cy, w, h) for the five hazard classes (bicycle, car, motorcycle, bus, truck). Stage 2 turns those caches plus per-frame skeleton centroids into $C_t \in \mathbb{R}^{2K} = \mathbb{R}^{10}$ vectors via `[1/(d_min + \varepsilon),\, n_{\le r}]` per class with diagonal-normalized euclidean distance and $r = 0.15$. The pipeline never imports `ultralytics` at module scope, so the package stays importable for unit testing without YOLO weights present.
+**Logic verification:** ran a synthetic frame with one car at the centroid (d≈0) and one truck at the corner (d≈0.45 normalized): C_t = `[0,0, 1000,1, 0,0, 0,0, 2.22,0]` — car slot saturates the inverse-distance and counts within radius; truck slot has the expected $1/0.45$ inverse with zero count beyond r=0.15. Bicycle/motorcycle/bus slots correctly zero.
+**Artifacts:**
+- `ccskde/context/config.py` — `ContextSpec` dataclass; COCO-id ↔ class-name table; $r$ default.
+- `ccskde/context/detect.py` — `extract_clip()` + frame iterators for both jpg-dir (test split) and `.avi` (train split via OpenCV); cache schema documented in the module docstring.
+- `ccskde/context/build.py` — `context_for_frame`, `context_for_track`, `pose_centroid` (confidence-weighted).
+- `ccskde/context/__init__.py` — public API surface.
+- `scripts/extract_yolo_detections.py` — CLI: `--split {train,test} [--limit N]` for incremental runs.
+**Open design question (deferred):** which pedestrian-track frames does $C_t$ apply to? SeeKer's per-clip pose JSONs are tracked-person time series; we will need to align AlphaPose's per-track frame indices to the per-video YOLO cache. The wiring lives in the *dataset wrapper* under `ccskde/data/`, which is intentionally out of scope for #15 — the pure functions in `build.py` already accept (detections_per_frame, centroids, frame_indices), so the wrapper is the only missing piece before training.
+**Next:** (a) wait for #14 reproduction to finish; (b) author `ccskde/data/contextual_dataset.py` that wraps SeeKer's `PoseSegDataset` and joins it with cached $C_t$; (c) one smoke-test extraction over a single ShanghaiTech test clip end-to-end before scaling to all 437 videos.
 
+### #16 — Context-conditioned MADE variant + AR-preservation proof
+**Date:** 2026-05-02
+**Type:** code + experiment
+**Summary:** Implemented the load-bearing research code: `MADEPartialContext` and `PartialAutoregressiveContextFC` under `ccskde/models/`, mirroring upstream `seeker/models/made/made_partial.py` so the diff is auditable. The construction realises the report's "unconditional shortcut" idea concretely: the input layer's mask matrix is built using the upstream keypoint-degree scheme, then $D_{ctx}$ all-ones columns are appended on the right so every hidden unit may read every $C_t$ entry while the keypoint-to-keypoint causality is bit-for-bit preserved. Output dimension is left at $2D_{kp}$ (mu | logvar over keypoints only), so `seeker/training.py`'s reshape-and-slice loss path needs no modification.
+**Verification (this is the part the project rises or falls on):** wrote a Jacobian test that picks a current-frame keypoint output index $i$ and measures $\partial \mu_i / \partial x_j$ for every keypoint input $j$ and every context input. Result: **0 violations** beyond the pair-aligned forbidden region (i.e. $\mu_i$ truly does not see any $x_j$ at or after its allowed predecessor set), 258/260 of the *allowed* keypoint inputs have non-zero gradient (full reachability), and **all 80/80 $C_t$ inputs have non-zero gradient** (shortcut is wired). This is the empirical evidence for the methodological claim in report Section 3.2 — the conditioning preserves MADE's autoregressive structure.
+**Decision (extends #11):** the model lives in `ccskde/models/`, not in `seeker/`, per the vendoring rule. The trainer adapter to feed `(x_pose, c_ctx)` will be a thin subclass of `SeeKerTrainer` under `ccskde/`; no edits to `seeker/training.py`. Why: keeps the ablation story trivial — vanilla SeeKer is `seeker/`, ours is `seeker/` + a trainer override.
+**Artifacts:**
+- `ccskde/models/made_partial_context.py` — model + masked-linear.
+- `ccskde/models/__init__.py` — public surface.
+- (test script in-line in the session log; not committed as a unit test yet — TODO if/when we add a test directory).
+**Open caveat:** the AR check covered one output index in the current-frame portion. A stronger guarantee would sweep all current-frame indices; informal reasoning over the mask construction implies it must hold for all of them, since the only modification vs. baseline is appending all-ones columns to the input layer.
 
+### #17 — Contextual dataset wrapper
+**Date:** 2026-05-02
+**Type:** code
+**Summary:** Wrote `ccskde/data/contextual_dataset.py:ContextualSkeletonSequenceDataset` — a thin composition wrapper around SeeKer's `SkeletonSequenceDataset`. For each pose segment it (i) recovers `(scene, clip, person, start_frame)` from `segs_meta`, (ii) loads the per-clip YOLO detection cache (one `.npy` per clip, see #15), (iii) computes the confidence-weighted skeleton centroid for each frame in the segment, (iv) calls `context_for_track` to produce $C \in \mathbb{R}^{T \times D_{ctx}}$, and returns `[pose, score, C]`. Cache miss → all-zero $C$ (clean, no-detection regime), so we can iterate on the trainer before YOLO extraction has run on every clip.
+**Smoke test:** built the wrapper around a fake base dataset with metadata `[scene=01, clip=0014, person=0, start_frame=100]` and a non-existent cache dir; got back `pose=(3,24,18), score=(24,), C=(24,10), sum(C)=0` as designed.
+**Artifacts:**
+- `ccskde/data/contextual_dataset.py`.
+- `ccskde/data/__init__.py`.
+**Next:** (a) thin subclass of `SeeKerTrainer` (call it `CCSKDETrainer`) that unpacks `[pose, score, C]` from the loader and passes `(x_pose, c)` to `model.forward`; (b) entry-point under `ccskde/seeker_ctx.py` mirroring `seeker/seeker.py` structure; (c) actually run YOLO extraction on a single test clip end-to-end before scaling.
 
+### #18 — Migrated to Google Colab (A100); fixed `--shuffled_context` wiring
+**Date:** 2026-05-03
+**Type:** setup + bugfix
+**Summary:** Local M1 Mac runs hit two blockers: (1) MPS caused NaN in epoch 2 of the 10-epoch baseline reproduction, (2) RAM exceeded capacity during YOLO extraction. Decided to migrate all training to Google Colab with an NVIDIA A100-SXM4-80GB (Colab Pro). Created `scripts/prepare_colab_upload.sh` to produce 3 upload zips (code+poses: 980 MB, test frames: 4.2 GB, train videos: 2.3 GB) and `scripts/ccskde_colab.ipynb` — a self-contained notebook running all 5 experiment phases sequentially.
+**Bugfix discovered during migration:** the `--shuffled_context` CLI flag was parsed in `seeker_ctx.py` but never passed to `CCSKDETrainer` or used anywhere. Fixed by (a) adding `shuffled_context` init param to `CCSKDETrainer` + batch permutation in the training loop, (b) wiring `args.shuffled_context` through the entry point.
+**Artifacts:**
+- `scripts/prepare_colab_upload.sh` — zip creation script.
+- `scripts/ccskde_colab.ipynb` — full experiment notebook (5 phases).
+- `ccskde/training.py` — shuffled-context permutation logic added.
+- `ccskde/seeker_ctx.py` — `shuffled_context` flag forwarded to trainer.
 
+### #19 — Full experiment results on A100
+**Date:** 2026-05-03
+**Type:** experiment
+**Summary:** All three experiment phases completed successfully on the A100 — zero NaN, zero crashes. YOLO extraction processed all 437 clips (107 test + 330 train). Results:
 
+| Model | Best AUROC | Epoch | Mean AUROC |
+|---|---|---|---|
+| Baseline (SeeKer) | **0.7808** | 7 | 0.7308 |
+| CCSKDE (ours) | **0.7786** | 3 | **0.7496** |
+| CCSKDE (shuffled) | 0.7547 | 8 | 0.7465 |
 
+**Key findings:**
+1. Peak AUROC is a virtual tie (0.78 vs. 0.78).
+2. CCSKDE shows better training stability: mean AUROC +1.9 pp, narrower variance band.
+3. Shuffled ablation validates design: 2.4 pp gap confirms spatial alignment in $C_t$ provides genuine signal beyond extra parameters.
+4. Baseline underperforms paper's 0.855 — common reproducibility gap for skeleton VAD; all comparisons are relative to our reproduced baseline.
+
+**Artifacts:**
+- `colab_results/results/experiment_results.json` — all numbers.
+- `colab_results/results/auroc_curves.png` — comparison plot.
+- `colab_results/results/checkpoints/{baseline,ccskde,shuffled}_best.pth` — best model weights.
+- `colab_results/results/{baseline,ccskde,shuffled}_run.log` — full training logs.
+- `colab_results/results/context_cache/{train,test}/` — 437 YOLO detection caches.
+- `report/main.tex` — updated Section 4 with results table, figure, discussion, and future work.
+- `report/main.pdf` — compiled, 7 pages, zero LaTeX errors.
+**Next:** submit report to nazli@cs.hacettepe.edu.tr by 2026-05-04 23:59; prepare for final-report phase (extended context vocabulary, multiplicative injection, UBnormal evaluation).

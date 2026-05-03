@@ -12,14 +12,43 @@ venv/
 env/
 .python-version
 
-# Data & experiments (large / generated)
+# Data (large — poses, frames, videos)
 data/
+
+# Experiment checkpoints (large binary)
 exp_dir/
+exp_dir_ccskde/
+exp_dir_shuffled/
 runs/
-checkpoints/
+
+# Model weights (large binary)
 *.ckpt
 *.pt
 *.pth
+
+# Upload zips (large, regenerable)
+ccskde_code_and_poses.zip
+ccskde_test_frames.zip
+ccskde_train_videos.zip
+results-*.zip
+
+# Colab results — keep JSON/PNG/logs, exclude large checkpoints and caches
+colab_results/results/checkpoints/
+colab_results/results/context_cache/
+colab_results/results/exp_dir*/
+
+# LaTeX build artifacts
+report/*.aux
+report/*.log
+report/*.out
+report/*.bbl
+report/*.blg
+report/*.fls
+report/*.fdb_latexmk
+report/*.synctex.gz
+report_overleaf/*.aux
+report_overleaf/*.log
+report_overleaf/*.out
 
 # Editor / OS
 .vscode/
@@ -28,3 +57,6 @@ checkpoints/
 
 # Notebooks
 .ipynb_checkpoints/
+
+# Claude / Gemini
+.claude/
