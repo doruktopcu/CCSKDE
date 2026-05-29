@@ -1,5 +1,38 @@
 # CCSKDE Checkpoint
 
+> ## Update — 2026-05-29 (uplift session, Windows / RTX 5080)
+>
+> The project was resumed on a new machine and substantially uplifted. The
+> headline is that the milestone's null result was traced to a **bug**, not a
+> dead idea (see progress log #20–#26).
+>
+> **Root cause found.** The context vector was computed in the wrong coordinate
+> frame: the pedestrian centroid came from the *normalised* pose (zero-mean /
+> unit-std) while YOLO boxes are in `[0,1]` image space, so `C_t` was
+> effectively pedestrian-independent. Fixed (centroid from raw px ÷ (856,480)).
+> A 1-epoch sanity run already moved corrected-proximity from a *tie* to
+> baseline 0.742 → **0.790**.
+>
+> **Three contributions added on top:**
+> 1. **Car-matrix context** — each nearest hazard as a 6-keypoint oriented
+>    skeleton (YOLOv11-seg → minAreaRect), pedestrian-relative & scale-invariant.
+> 2. **FiLM covariance modulation** — realises the proposal's "contextual
+>    covariance penalty"; zero-init identity; AR-preserving (Jacobian test: 0
+>    violations).
+> 3. **Hazard-subset evaluation** — isolates pedestrian-vehicle events +
+>    score-vs-proximity correlation (the question the milestone never answered).
+>    Baseline reference: vehicle-hazard AUROC ≈ 0.84–0.88, Spearman ≈ 0.31.
+>
+> **Also:** report covariance description corrected (diagonal, not Cholesky —
+> matches code & SeeKer's headline config); `tests/` suite added; two project
+> skills (`ccskde-run`, `ccskde-eval`); unified `scripts/run_experiments.py`.
+>
+> **In flight at write time:** oriented YOLO-seg extraction on the train split,
+> then the full experiment matrix → results land in `colab_results/results_v2/`
+> and progress-log #27.
+
+---
+
 **Date:** 2026-05-23
 **Branch:** `main` (clean except `seeker` submodule edits, intentional)
 **Stage:** Milestone report submitted; planning remediation of the traffic-hazard evaluation gap.

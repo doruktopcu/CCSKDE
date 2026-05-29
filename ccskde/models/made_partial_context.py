@@ -136,6 +136,20 @@ class PartialAutoregressiveContextFC(nn.Module):
     x_pose: (B, ...) — flattened to (B, n_kp).
     c_ctx:  (B, ...) — flattened to (B, n_ctx). Pass None to behave as baseline
             (n_ctx must have been initialised to 0).
+
+    If ``film_cov=True`` a FiLM head (Perez et al., 2018) maps the context to a
+    per-coordinate ``(gamma, beta)`` that modulates the predicted *covariance*::
+
+        logvar <- (1 + gamma(C)) * logvar + beta(C)
+
+    This is the concrete realisation of the proposal's "contextual covariance
+    penalty": the network can shrink the predicted variance (beta < 0) in
+    high-hazard spatial configurations, so a small kinematic deviation yields a
+    large Mahalanobis anomaly score exactly when we want the detector to fire.
+    The FiLM output layer is zero-initialised, so at the start of training
+    gamma=0, beta=0 and the model is *identical* to the shortcut-only variant
+    (and thus to the baseline when C carries no signal). FiLM depends only on C,
+    never on keypoints, so MADE's autoregressive causality is preserved.
     """
 
     def __init__(
@@ -144,18 +158,36 @@ class PartialAutoregressiveContextFC(nn.Module):
         ctx_dim: int,
         hidden_dims: List[int],
         droppout: float = 0.5,
+        film_cov: bool = False,
+        film_hidden: int = 64,
     ) -> None:
         super().__init__()
         self.dim = dim
         self.ctx_dim = ctx_dim
         self.hidden_dims = hidden_dims
+        self.film_cov = film_cov and ctx_dim > 0
         self.model = MADEPartialContext(dim, ctx_dim, hidden_dims, droppout)
+        if self.film_cov:
+            self.film = nn.Sequential(
+                nn.Linear(ctx_dim, film_hidden),
+                nn.ReLU(),
+                nn.Linear(film_hidden, 2 * dim),   # (gamma, beta) over logvar coords
+            )
+            nn.init.zeros_(self.film[-1].weight)   # identity init: gamma=beta=0
+            nn.init.zeros_(self.film[-1].bias)
 
     def forward(self, x_pose: Tensor, c_ctx: Tensor | None = None) -> Tensor:
         x = x_pose.flatten(start_dim=1)
+        c = None
         if self.ctx_dim > 0:
             if c_ctx is None:
                 raise ValueError("ctx_dim>0 but c_ctx is None")
             c = c_ctx.flatten(start_dim=1)
             x = torch.cat((x, c), dim=1)
-        return self.model(x)
+        out = self.model(x)
+        if self.film_cov:
+            mu, logvar = torch.chunk(out, 2, dim=1)
+            gamma, beta = torch.chunk(self.film(c), 2, dim=1)
+            logvar = (1.0 + gamma) * logvar + beta
+            out = torch.cat((mu, logvar), dim=1)
+        return out

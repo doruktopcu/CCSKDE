@@ -4,9 +4,12 @@ from .made_partial_context import (
     MaskedLinear,
     PartialAutoregressiveContextFC,
 )
+from .scene_made import PartialAutoregressiveSceneFC, SceneMADEPartial
 
 __all__ = [
     "MADEPartialContext",
     "MaskedLinear",
     "PartialAutoregressiveContextFC",
+    "PartialAutoregressiveSceneFC",
+    "SceneMADEPartial",
 ]

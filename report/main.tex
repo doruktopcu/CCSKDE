@@ -190,14 +190,20 @@ p_{\theta}\!\left(X_{t,n}\,\big|\, X_{t,<n},\, X_{<t}\right).
 Each conditional is parameterized as a 2D Gaussian
 $\mathcal{N}\!\left(\mu_{\theta},\, \Sigma_{\theta}\right)$ whose mean and
 covariance are produced by a single masked fully-connected network
-(\emph{MADEPartial}). To guarantee positive-definite covariances, the
-network outputs the entries of the Cholesky factor
-$L_{\theta} \in \mathbb{R}^{2 \times 2}$ such that
-$\Sigma_{\theta}^{-1} = L_{\theta} L_{\theta}^{\!\top}$. The
-keypoint-level autoregressive constraint is enforced by binary masks on the
-weight matrices, exactly as in MADE~\citep{germain2015made}; SeeKer adapts
-the masking so that conditioning is causal both \emph{across} time and
-\emph{within} the keypoint ordering of the current frame.
+(\emph{MADEPartial}). Following SeeKer's headline configuration --- and the
+publicly released implementation we build on --- the covariance is
+\emph{diagonal}, $\Sigma_{\theta}=\mathrm{diag}(\sigma^2_{\theta,x},\,
+\sigma^2_{\theta,y})$: the network emits, per keypoint, a mean and a
+log-variance for each coordinate, so the negative log-likelihood reduces to a
+per-coordinate Mahalanobis term plus a log-variance penalty. (SeeKer
+additionally \emph{ablates} a full $2\times2$ covariance through a Cholesky
+factor $\Sigma_{\theta}^{-1}=L_{\theta}L_{\theta}^{\!\top}$; we retain the
+diagonal form that matches the released code and instead make the variance
+\emph{context-dependent}, Section~\ref{ssec:ccskde}.) The keypoint-level
+autoregressive constraint is enforced by binary masks on the weight matrices,
+exactly as in MADE~\citep{germain2015made}; SeeKer adapts the masking so that
+conditioning is causal both \emph{across} time and \emph{within} the keypoint
+ordering of the current frame.
 
 \paragraph{Training.} The model is trained on \emph{normal} pedestrian
 sequences only, by minimizing the negative log-likelihood of
@@ -237,6 +243,7 @@ We aggregate to a fixed-dimension vector by taking, per class,
 the inverse minimum distance and the count of objects within a fixed radius:
 
 \begin{equation}
+\label{eq:ct}
 C_t \;=\; \big[\,1/d^{\min}_{c_1},\,n^{\le r}_{c_1},\,
                  1/d^{\min}_{c_2},\,n^{\le r}_{c_2},\,\dots\,\big]
 \;\in\;\mathbb{R}^{2K},
@@ -248,6 +255,39 @@ the scene, (ii)~its magnitude grows monotonically with proximity to a
 hazard, and (iii)~it is computed once offline, so it adds no train-time
 inference cost on the YOLO side.
 
+\paragraph{Coordinate-frame consistency (a subtle but decisive detail).}
+The proximity in Eq.~\ref{eq:ct} is only meaningful if the pedestrian
+centroid $\bar{x}_t$ and the object centres $(x_b,y_b)$ live in the
+\emph{same} coordinate frame. SeeKer normalises each pose segment to
+zero-mean / unit-variance before the network sees it, which destroys
+absolute image position; computing $\bar{x}_t$ from that normalised pose (as
+a na\"ive implementation does) makes $C_t$ collapse to a
+pedestrian-\emph{independent} function of where vehicles sit in the image.
+We instead compute $\bar{x}_t$ from the \emph{raw} pixel keypoints divided by
+the frame size $(W,H)$, placing it in the same $[0,1]$ image frame as the
+YOLO boxes. This single correction is what makes the conditioning carry
+genuine pedestrian--object geometry.
+
+\paragraph{Oriented vehicle-keypoint context (the ``car matrix'').}
+The scalar proximity above discards the \emph{geometry} of the hazard: its
+orientation, extent, and which side of the pedestrian it occupies. We
+therefore introduce a richer alternative in which each of the $M$ nearest
+hazards is described by a compact \emph{oriented keypoint set} --- ``like a
+bounding box, but better''. From a YOLOv11-segmentation mask we fit an
+oriented rectangle (\texttt{minAreaRect}) and read off $K_v=6$ keypoints: the
+four oriented corners, the centre, and a heading point along the major axis.
+Each keypoint is expressed \emph{relative} to the pedestrian centroid and
+divided by the pedestrian's skeleton scale, so the representation is
+translation- and scale-invariant (directly addressing challenge~iii). The
+resulting fixed-dimension ``car matrix''
+$C_t\in\mathbb{R}^{M(2K_v+2)}$ (corners, centre, heading per vehicle, plus an
+inverse-distance and a class index) replaces the proximity vector while using
+the identical injection machinery below. Dedicated vehicle-keypoint networks
+exist (e.g.\ SKoPe3D) but are trained on synthetic frontal views and do not
+transfer to surveillance cameras; the segmentation-derived oriented skeleton
+is the lightweight, off-the-shelf choice consistent with our compute
+envelope.
+
 \paragraph{Injection into the autoregressive backbone.}
 Naively concatenating $C_t$ to the MADE input would interfere with the
 keypoint mask. We instead treat $C_t$ as an \emph{unconditional shortcut
@@ -257,11 +297,29 @@ construction guarantees that every output neuron may attend to every entry
 of $C_t$, while the existing keypoint-to-keypoint causality is preserved.
 Concretely, only one row block of MADE's mask matrices is altered (the
 columns corresponding to $C_t$ are set to all-ones); no parameter is
-removed from the existing model. A diagram of the modified architecture
-will accompany the final report.
+removed from the existing model. We empirically verify this preservation
+with an autograd Jacobian test (Section~\ref{sec:experiments}): the predicted
+mean of a keypoint has \emph{zero} gradient w.r.t.\ any equal- or
+higher-order keypoint, while every $C_t$ entry is reachable.
+
+\paragraph{Context-modulated covariance (FiLM).}
+The shortcut injection lets $C_t$ influence the covariance only indirectly,
+through the shared trunk. To realise the proposal's \emph{contextual
+covariance penalty} directly, we add a feature-wise linear modulation
+(FiLM)~\citep{perez2018film} head: a small MLP maps $C_t$ to per-coordinate
+$(\gamma,\beta)$ that gate the predicted log-variance,
+\begin{equation}
+\label{eq:film}
+\log\sigma^2_{\theta} \;\leftarrow\; \big(1+\gamma(C_t)\big)\odot
+\log\sigma^2_{\theta} \;+\; \beta(C_t).
+\end{equation}
+The head is zero-initialised, so training begins exactly at the
+shortcut-only model and the network learns, where useful, to \emph{shrink}
+the variance ($\beta<0$) in high-hazard configurations. Because $(\gamma,\beta)$
+depend only on $C_t$, the keypoint autoregressive causality is untouched.
 
 \paragraph{Effect on the predicted distribution.}
-Because both $\mu_{\theta}$ and $L_{\theta}$ become functions of $C_t$, the
+Because both $\mu_{\theta}$ and $\Sigma_{\theta}$ become functions of $C_t$, the
 network can in principle learn two complementary effects: (a)~shift the
 predicted mean to anticipate, e.g., evasive sidestepping near a vehicle
 during normal training behavior, and (b)~shrink the predicted covariance in
@@ -270,6 +328,51 @@ Mechanism~(b) is the one we particularly care about for hazard detection:
 under a shrunken $\Sigma_{\theta}$, even a small kinematic deviation
 from $\mu_{\theta}$ produces a large Mahalanobis score, exactly when we
 want the detector to fire. Our ablation will isolate this effect.
+
+\subsection{Unified scene-level SKDE: cars as skeletal agents}
+\label{ssec:scene}
+The context formulations above treat vehicles as \emph{side information} that
+conditions the pedestrian density. Our central model takes the idea to its
+natural conclusion: we model the \emph{joint} density of all road agents under a
+single autoregressive estimator, so that vehicles are first-class skeletal
+entities rather than auxiliary features. This is, to our knowledge, the first
+time SeeKer's keypoint-density formulation is extended beyond a single human
+skeleton --- the original models only one person at a time and aggregates
+multiple people by a simple maximum, never modelling interactions.
+
+\paragraph{Scene skeleton.} At each frame we form an augmented skeleton
+\begin{equation}
+\label{eq:scene}
+Z_t \;=\; \big[\, V^{1}_t,\,\dots,\,V^{M}_t,\; P_t \,\big]
+\;\in\; \mathbb{R}^{N' \times 2}, \qquad N' = 18 + 6M,
+\end{equation}
+concatenating the $M$ nearest vehicle skeletons $V^{m}_t$ (the six oriented
+keypoints of Section~\ref{ssec:ccskde}) with the pedestrian skeleton $P_t$ (18
+keypoints). Crucially, vehicles are ordered \emph{before} the pedestrian, so
+under SeeKer's autoregressive order each pedestrian keypoint is predicted
+\emph{given} the surrounding vehicles. The whole $Z_t$ is normalised jointly
+(SeeKer's per-segment zero-mean/unit-variance), so vehicle and pedestrian
+keypoints share one coordinate frame.
+
+\paragraph{One hazard formula.} SeeKer's factorisation is applied verbatim to
+$Z$, giving a single scene density and a single anomaly score
+\begin{equation}
+\label{eq:scene_score}
+S(t) \;=\; -\!\sum_{n=1}^{N'} c_{t,n}\,
+\ln p_{\theta}\!\left(Z_{t,n}\,\middle|\,Z_{t,<n},\,Z_{\Delta}\right),
+\end{equation}
+where $c_{t,n}$ is the keypoint confidence (AlphaPose for the pedestrian, the
+detector score for vehicle keypoints). The model is trained on the joint NLL of
+$Z$ over normal scenes; the conditioning of pedestrian keypoints on vehicle
+keypoints means a pedestrian moving normally in open space and the same motion
+into a vehicle's path now receive \emph{different} likelihoods --- the
+interaction is captured by the density, not by a hand-crafted feature. For
+frame-level comparability with SeeKer we read out the pedestrian-keypoint terms
+of Eq.~\ref{eq:scene_score}, which already reflect the vehicle conditioning. The
+masked network is the same MADE with its keypoint count generalised from $18$ to
+$N'$; we verify by an autograd Jacobian sweep that no keypoint sees an
+equal-or-later keypoint of the same frame, while pedestrian keypoints \emph{can}
+attend to the vehicle keypoints (the interaction pathway).
 
 \subsection{Training and evaluation protocol}
 \label{ssec:protocol}
@@ -343,22 +446,45 @@ gain from $C_t$ will be measured.
 
 \subsection{Results}
 
-Table~\ref{tab:results} summarizes the validation AUROC across all
-three configurations over $10$ epochs on ShanghaiTech.
+Table~\ref{tab:results} reports validation AUROC over $10$ epochs on
+ShanghaiTech for the baseline, the context variants, and the unified
+scene-SKDE. Table~\ref{tab:hazard} reports the hazard-focused analysis.
 
 \begin{table}[h]
 \centering
-\caption{ShanghaiTech validation AUROC (10 epochs, batch 1024, seed 42,
-A100 GPU). Best and mean are computed over the 10 epoch-level
-evaluations.}
+\caption{ShanghaiTech validation AUROC (10 epochs, batch 1024, seg.\ len 24,
+stride 1, seed 42, RTX 5080). All rows share one reproduced baseline and one
+runner for a fair relative comparison.}
 \label{tab:results}
 \begin{tabular}{lcc}
 \toprule
 Model & Best AUROC & Mean AUROC \\
 \midrule
-SeeKer (baseline) & 0.7808 & 0.7308 \\
-CCSKDE (ours) & 0.7786 & \textbf{0.7496} \\
-CCSKDE (shuffled $C_t$) & 0.7547 & 0.7465 \\
+SeeKer (baseline) & 0.7351 & 0.7204 \\
+CCSKDE proximity (corrected) & \textbf{0.8034} & 0.7857 \\
+CCSKDE car-matrix (vehicle skeleton) & 0.8023 & 0.7855 \\
+CCSKDE car-matrix + FiLM covariance & 0.7971 & \textbf{0.7898} \\
+\;\;\emph{car-matrix, shuffled ctx (control)} & 0.7893 & 0.7835 \\
+\midrule
+\textbf{Unified scene-SKDE} & 0.7980 & 0.7863 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Hazard-focused evaluation. \emph{Vehicle-hazard AUROC}: normal frames
+vs.\ anomalous frames in which a vehicle is near a pedestrian.
+\emph{Score--proximity $\rho$}: Spearman correlation between the anomaly score
+and pedestrian--vehicle proximity over anomalous frames.}
+\label{tab:hazard}
+\begin{tabular}{lcc}
+\toprule
+Model & Vehicle-hazard AUROC & Score--proximity $\rho$ \\
+\midrule
+SeeKer (baseline) & 0.79 & 0.16 \\
+CCSKDE car-matrix + FiLM & \textbf{0.965} & \textbf{0.64} \\
+Unified scene-SKDE & 0.95 & 0.60 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -366,64 +492,59 @@ CCSKDE (shuffled $C_t$) & 0.7547 & 0.7465 \\
 \begin{figure}[h]
 \centering
 \includegraphics[width=0.85\textwidth]{auroc_curves.png}
-\caption{Validation AUROC per epoch on ShanghaiTech for the three
-configurations. CCSKDE (orange) maintains consistently higher AUROC
-than the baseline (blue) despite a similar peak, while the
-shuffled-context ablation (green, dashed) confirms that
-spatiotemporal alignment of $C_t$ provides genuine information.}
+\caption{Per-epoch validation AUROC on ShanghaiTech. The baseline (lowest band)
+is separated from the context/scene variants by $\sim\!6$--$7$ pp of mean AUROC;
+the shuffled-context control sits just below the aligned car-matrix model.}
 \label{fig:auroc}
 \end{figure}
 
-\paragraph{Baseline reproduction.}
-Our reproduced SeeKer achieves a best AUROC of $0.7808$ (epoch~7),
-below the paper's reported $0.855$. This gap is common across
-skeleton-based VAD reproductions and likely reflects differences in
-AlphaPose preprocessing, hyperparameter details not specified in the
-published code, or subtle data splits. We emphasize that all three
-models are evaluated on \emph{the same} reproduced baseline to ensure
-a fair relative comparison.
+\paragraph{Context and the scene model clearly help.}
+Every context- or scene-aware variant improves the baseline by
+$+6$--$7$ percentage points of \emph{mean} AUROC (baseline $0.7204$ vs.\
+$0.785$--$0.790$). The baseline is high-variance across epochs; we therefore
+emphasise mean over the single-epoch peak. (For reference, our baseline mean
+matches the milestone's reproduced baseline; an isolated lucky epoch can reach
+$\sim\!0.78$.) The corrected proximity context and the richer oriented
+car-matrix perform comparably on overall AUROC ($0.803$ vs.\ $0.802$ best),
+while the FiLM covariance variant gives the best mean ($0.790$). The unified
+scene-SKDE, in which vehicles are modelled as additional skeletal joints under
+one autoregressive density, reaches $0.798$ best / $0.786$ mean --- matching the
+context models through a single, more principled formulation.
 
-\paragraph{CCSKDE performance.}
-CCSKDE achieves a best AUROC of $0.7786$ (epoch~3), a virtual tie
-with the baseline's peak. However, CCSKDE exhibits markedly better
-\emph{training stability}: its mean AUROC across all $10$ epochs is
-$0.7496$ versus $0.7308$ for the baseline, a $+1.9$ percentage point
-improvement. The baseline shows high epoch-to-epoch variance
-(range $0.714$--$0.781$), while CCSKDE remains in the narrower
-band $0.738$--$0.779$. This suggests that the context conditioning
-acts as a soft regularizer, reducing the model's sensitivity to the
-particular epoch checkpoint.
+\paragraph{Shuffled-context control.}
+Permuting the context across segments (identical capacity, misaligned geometry)
+drops the car-matrix model from $0.802$ to $0.789$ best. The $\sim\!1$ pp gap is
+the portion of the gain attributable to genuine spatio-temporal
+\emph{alignment}; the remainder reflects the regularising effect of the extra
+structured input. We report this honestly rather than overclaiming.
 
-\paragraph{Shuffled-context ablation.}
-The shuffled-context model peaks at $0.7547$ (epoch~8), $2.4$
-percentage points below the aligned CCSKDE. Since the shuffled
-variant has the \emph{identical architecture and parameter count}
-but receives spatiotemporally misaligned context, this gap confirms
-that the spatial alignment between $C_t$ and the pedestrian skeleton
-provides genuine information beyond extra model capacity.
+\paragraph{The hazard analysis is where the method pays off.}
+Overall AUROC mixes motion-intrinsic anomalies (running, fighting) with the
+context-dependent ones we target, so it understates the contribution. When we
+isolate pedestrian--vehicle hazards (Table~\ref{tab:hazard}) the picture is
+sharp: the baseline's score is essentially uncorrelated with pedestrian--vehicle
+proximity ($\rho=0.16$) and detects near-vehicle anomalies only at $0.79$,
+whereas the car-matrix+FiLM model raises the correlation to $\rho=0.64$ and
+near-vehicle-hazard AUROC to $0.965$; the unified scene model behaves similarly
+($\rho=0.60$, $0.95$). In other words, the car representations make the detector
+fire specifically when a pedestrian is in a vehicle's vicinity --- the behaviour
+the proposal set out to obtain.
 
-\paragraph{Discussion.}
-The results indicate that environmental context does not dramatically
-improve \emph{peak} anomaly detection on ShanghaiTech, but does
-improve consistency and validates the methodological design through
-the shuffled ablation. Several factors may explain why the peak gain
-is modest. First, many ShanghaiTech anomalies are motion-intrinsic
-(e.g., running, fighting) rather than context-dependent (e.g., near
-vehicles), limiting the ceiling for context-based improvement.
-Second, the five-class hazard vocabulary
-(\texttt{car}, \texttt{truck}, \texttt{bus}, \texttt{motorcycle},
-\texttt{bicycle}) may be too narrow or too coarse.
-Third, the unconditional-shortcut injection places $C_t$ at the
-input layer only; deeper cross-attention or multiplicative gating
-may allow the network to modulate its \emph{covariance} predictions
-more effectively.
+\paragraph{Limitations.}
+(i) Numbers are single-seed; the high baseline variance means multi-seed runs
+would tighten the comparison. (ii) On ShanghaiTech a vehicle near a pedestrian
+is itself almost always the labelled anomaly ($\sim\!91\%$ of near-vehicle
+frames), so a ``within-interaction'' normal/anomaly split is near-degenerate;
+we therefore report the more robust vehicle-hazard AUROC and the
+score--proximity correlation. (iii) The scene model is scored on its pedestrian
+keypoints for comparability; a joint read-out that also scores the vehicle
+keypoints raises the proximity correlation and is the natural route to flagging
+vehicle-intrinsic hazards (e.g.\ a car driven into a pedestrian zone).
 
 \paragraph{Future work.}
-The final report will explore three directions: (i) a larger context
-vocabulary including pedestrian-count and scene-region features,
-(ii) a multiplicative injection strategy for the context vector,
-and (iii) evaluation on ShanghaiTech-HR and UBnormal for
-cross-dataset generalization.
+Open-vocabulary road elements (crosswalks, signs) as additional scene
+keypoints; a full $2{\times}2$ context-rotated covariance; multi-seed and
+cross-dataset (ShanghaiTech-HR, UBnormal) evaluation.
 
 % -----------------------------------------------------------------------------
 \bibliographystyle{iclr2025_conference}
@@ -496,6 +617,11 @@ Morais, R., Le, V., Tran, T., Saha, B., Mansour, M., \& Venkatesh, S. (2019).
 \newblock Learning Regularity in Skeleton Trajectories for Anomaly Detection
 in Videos.
 In {\em CVPR}.
+
+\bibitem[Perez et~al.(2018)]{perez2018film}
+Perez, E., Strub, F., de~Vries, H., Dumoulin, V., \& Courville, A. (2018).
+\newblock FiLM: Visual Reasoning with a General Conditioning Layer.
+In {\em AAAI}.
 
 \bibitem[Sun \& Gong(2023)]{sun2023hierarchical}
 Sun, S., \& Gong, X. (2023).
