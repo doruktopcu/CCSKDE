@@ -432,3 +432,27 @@ yolo11l-seg re-extraction, multi-seed runs, joint-readout scene scoring default,
 full 2×2 context-rotated covariance.
 **Artifacts:** `README.md`, `HANDOFF.md`, `CLAUDE.md`, `report/main.pdf`,
 memory `ccskde-env.md`.
+
+### #30 — Vendored the SeeKer baseline (de-submodule)
+**Date:** 2026-05-29
+**Type:** decision + code
+**Summary:** `seeker/` was an improperly-configured git **gitlink** — no
+`.gitmodules`, pointing at the unpushable local commit `3706984` — so a fresh
+`git clone` produced an *empty* `seeker/` and the tree always showed dirty
+("modified content, untracked content"). Reproduction across machines was only
+possible by manual SSD copy. Decision (user-approved): **vendor** SeeKer as plain
+tracked files in the CCSKDE repo for one-repo, clone-and-run reproducibility.
+This supersedes the original "vendored submodule" convention in #2/#3 (the
+read-only-baseline rule still stands; it is just no longer a nested repo).
+**How:** captured provenance first — `seeker/PORTABILITY_PATCHES.patch`
+(full diff vs upstream base `7e7ab66`, 5 files) and `seeker/VENDORED.md`
+(upstream URL, MIT license retained, base commit, rationale). Then
+`git rm --cached seeker`; `rm -rf seeker/.git`; `git add seeker`. The existing
+`.gitignore` (`exp_dir/`, `runs/`, `__pycache__/`, `*.pth`) already excludes the
+69 MB of training artifacts, so only 17 source files (~63 KB) were committed.
+**Verification:** `git status` now clean of `seeker`; vendored seeker imports OK
+and the ccskde→seeker bridge (`scene_dataset` → `normalize_pose`) works.
+**Reversible:** the gitlink history remains on `origin/final-ccskde` pre-merge,
+and the patch + VENDORED.md let the submodule be re-derived if ever wanted.
+**Artifacts:** commit `026166e`, `seeker/VENDORED.md`,
+`seeker/PORTABILITY_PATCHES.patch`.
