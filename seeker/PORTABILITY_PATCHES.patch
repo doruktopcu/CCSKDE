@@ -1,0 +1,117 @@
+diff --git a/models/made/made.py b/models/made/made.py
+index 3d33e25..f745122 100644
+--- a/models/made/made.py
++++ b/models/made/made.py
+@@ -21,11 +21,11 @@ class MaskedLinear(nn.Linear):
+             bias: Whether to include additive bias. Default: True.
+         """
+         super().__init__(n_in, n_out, bias)
+-        self.mask = None
++        self.register_buffer('mask', None)
+ 
+     def initialise_mask(self, mask: Tensor):
+         """Internal method to initialise mask."""
+-        self.mask = mask.to('cuda')
++        self.mask = mask
+ 
+     def forward(self, x: Tensor) -> Tensor:
+         """Apply masked linear transformation."""
+diff --git a/models/made/made_partial.py b/models/made/made_partial.py
+index 586ef6b..86dda18 100644
+--- a/models/made/made_partial.py
++++ b/models/made/made_partial.py
+@@ -19,11 +19,11 @@ class MaskedLinear(nn.Linear):
+             bias: Whether to include additive bias. Default: True.
+         """
+         super().__init__(n_in, n_out, bias)
+-        self.mask = None
++        self.register_buffer('mask', None)
+ 
+     def initialise_mask(self, mask: Tensor):
+         """Internal method to initialise mask."""
+-        self.mask = mask.to('cuda')
++        self.mask = mask
+ 
+     def forward(self, x: Tensor) -> Tensor:
+         """Apply masked linear transformation."""
+diff --git a/seeker.py b/seeker.py
+index 067a881..3c0b4ae 100644
+--- a/seeker.py
++++ b/seeker.py
+@@ -27,15 +27,15 @@ def main():
+ 
+     
+     args, model_args = init_sub_args(args)
+-    args.ckpt_dir = create_exp_dirs("./exp_dir", dirmap=args.dataset)
++    args.ckpt_dir = create_exp_dirs(args.exp_dir, dirmap=args.dataset)
+ 
+     pretrained = vars(args).get('checkpoint', None)
+     dataset, loader = get_dataset_and_loader(args, only_test=(pretrained is not None))
+ 
+     in_dim = 2*18*args.seg_len
+-    model = PartialAutoregressiveFC(dim=in_dim, hidden_dims=args.n_layers*[args.expansion_factor*(in_dim-2)], droppout=args.dropout)
++    model = PartialAutoregressiveFC(dim=in_dim, hidden_dims=args.n_layers*[args.expansion_factor*(in_dim-2)], droppout=args.droppout)
+     print(model)
+-    model.to('cuda')
++    model.to(args.device)
+     writer = SummaryWriter()
+     trainer = SeeKerTrainer(args, model, loader['train'], loader['test'], loader['validate'], 
+                                            dataset['validate'].metadata, dataset['test'].metadata,
+diff --git a/training.py b/training.py
+index 4c69a00..fae28d4 100644
+--- a/training.py
++++ b/training.py
+@@ -60,6 +60,7 @@ class SeeKerTrainer:
+         mu, logvar = torch.chunk(out, 2, dim=1)
+         mu = mu.reshape(B, T * N, A)[:, (-N-1):-1]
+         logvar = logvar.reshape(B, T * N, A)[:, (-N-1):-1]
++        logvar = logvar.clamp(min=-10.0, max=10.0)  # numerical stability on MPS
+ 
+         var = torch.exp(logvar)
+         E_inv = torch.diag_embed(1. / var)
+@@ -134,9 +135,9 @@ class SeeKerTrainer:
+ 
+                 pad = torch.randn(B, (T-1)*N).to(self.args.device)
+                 nll = - torch.cat((pad, lnp), dim=1)
+-                nll = nll.view(B, T,  N) * conf.cuda()
++                nll = nll.view(B, T,  N) * conf.to(self.args.device)
+                 nll = nll.flatten(start_dim=1)
+-            
++
+             probs = torch.cat((probs, nll), dim=0) # nll is the anomaly score
+         anomaly_scores_kp = probs.cpu().detach().numpy().squeeze().copy(order='C')
+ 
+@@ -167,9 +168,9 @@ class SeeKerTrainer:
+ 
+                 pad = torch.randn(B, (T-1)*N).to(self.args.device)
+                 nll = - torch.cat((pad, lnp), dim=1)
+-                nll = nll.view(B, T,  N) * conf.cuda()
++                nll = nll.view(B, T,  N) * conf.to(self.args.device)
+                 nll = nll.flatten(start_dim=1)
+-                    
++
+             probs = torch.cat((probs, nll), dim=0) # nll is the anomaly score
+         anomaly_scores_kp = probs.cpu().detach().numpy().squeeze().copy(order='C')
+ 
+diff --git a/validation.py b/validation.py
+index 43295aa..1ab2ba1 100644
+--- a/validation.py
++++ b/validation.py
+@@ -54,7 +54,7 @@ def get_all_frame_scores(scores, metadata, args=None, split='test', sigma=0):
+         clip_list = os.listdir(pose_segs_root)
+         clip_list = sorted(
+             fn.replace("alphapose_tracked_person.json", "tracks.txt") for fn in clip_list if fn.endswith('.json'))
+-        per_frame_scores_root = f'data/UBnormal/gt/{split}/'
++        per_frame_scores_root = os.path.join(args.data_dir, f'UBnormal/gt/{split}/')
+     elif args.dataset == 'avenue':
+         per_frame_scores_root = f'/mnt/sdb1/adelic/datasets/avenue/ground_truth_demo/testing_label_mask/'
+         clip_list = os.listdir(per_frame_scores_root)
+@@ -64,7 +64,7 @@ def get_all_frame_scores(scores, metadata, args=None, split='test', sigma=0):
+         clip_list = os.listdir(per_frame_scores_root)
+         clip_list = sorted(fn for fn in clip_list if fn.endswith('.npy'))
+     else:
+-        per_frame_scores_root = 'data/ShanghaiTech/gt/test_frame_mask/'
++        per_frame_scores_root = os.path.join(args.data_dir, 'ShanghaiTech/gt/test_frame_mask/')
+         clip_list = os.listdir(per_frame_scores_root)
+         clip_list = sorted(fn for fn in clip_list if fn.endswith('.npy'))
+ 
