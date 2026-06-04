@@ -65,7 +65,9 @@ def joint_lnp(model, x, c=None):
                    + torch.sum(logvar, dim=-1) + A * math.log(2 * math.pi))
 
 
-def score_test(model, loader, device, is_ctx):
+def score_test(model, loader, device, is_ctx, zero_ctx=False):
+    """Score the test set. If zero_ctx, the context vector is zeroed — the
+    'vehicle-removed' counterfactual (the model's pedestrian-only behaviour)."""
     model.eval().to(device)
     probs = torch.empty(0).to(device)
     for data_arr in loader:
@@ -74,6 +76,8 @@ def score_test(model, loader, device, is_ctx):
         conf = xc[..., -1].to(device)
         B, T, N, _ = x.shape
         c = data_arr[2].to(device).float() if is_ctx else None
+        if zero_ctx and c is not None:
+            c = torch.zeros_like(c)
         with torch.no_grad():
             lnp = joint_lnp(model, x, c)
             pad = torch.randn(B, (T - 1) * N, device=device)
@@ -140,14 +144,21 @@ def main():
     ap.add_argument("--context_mode", choices=["none", "proximity", "vehicle", "scene"], default="none")
     ap.add_argument("--max_vehicles", type=int, default=2)
     ap.add_argument("--kv", type=int, default=6)
-    ap.add_argument("--scene_readout", choices=["ped", "joint"], default="ped",
-                    help="scene model: score pedestrian keypoints only, or the "
-                         "joint scene NLL (captures vehicle-intrinsic hazards)")
+    ap.add_argument("--scene_readout", choices=["ped", "joint"], default="joint",
+                    help="scene model: joint scene NLL (default; captures "
+                         "vehicle-intrinsic hazards) or pedestrian keypoints only")
+    ap.add_argument("--counterfactual", action="store_true",
+                    help="context models: compare score with real vs zeroed "
+                         "context (vehicle removed); the difference isolates the "
+                         "vehicle's effect on pedestrian likelihood (interaction "
+                         "vs mere object presence).")
     ap.add_argument("--film_cov", action="store_true")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seg_len", type=int, default=24)
     ap.add_argument("--batch_size", type=int, default=1024)
     ap.add_argument("--taus", type=float, nargs="+", default=[2.0, 3.0, 5.0, 10.0])
+    ap.add_argument("--sigma", type=int, default=0,
+                    help="test-time temporal smoothing of the anomaly score")
     a = ap.parse_args()
 
     parser = init_parser()
@@ -189,12 +200,7 @@ def main():
     model.load_state_dict(ckpt["state_dict"], strict=False)
     print(f"[eval] loaded {a.checkpoint} (epoch {ckpt.get('epoch','?')})")
 
-    scores_kp = (score_test_scene(model, loader, a.device, a.scene_readout) if is_scene
-                 else score_test(model, loader, a.device, is_ctx))
-    auc, scores, gt = score_anomalies(scores_kp, base.metadata, args=args, split="test", ret_gt=True)
-    print(f"[eval] full-set AUROC (seeker scorer): {auc:.4f}")
-
-    # per-frame proximity in the SAME clip order score_anomalies used (sorted gt npy)
+    # --- per-frame proximity in the SAME clip order score_anomalies uses ---
     W, H = spec.img_wh
     coco_ids = tuple(HAZARD_CLASSES.values())
     gt_dir = os.path.join(a.data_dir, "ShanghaiTech", "gt", "test_frame_mask")
@@ -213,7 +219,39 @@ def main():
         prox_chunks.append(clip_frame_proximity(dets, peds, n_frames, coco_ids))
     proximity = np.concatenate(prox_chunks)
 
+    # --- counterfactual interaction probe (W1/W2) ---
+    if a.counterfactual and is_ctx:
+        kp_real = score_test(model, loader, a.device, is_ctx, zero_ctx=False)
+        kp_cf = score_test(model, loader, a.device, is_ctx, zero_ctx=True)
+        _, s_real, gt = score_anomalies(kp_real, base.metadata, args=args, split="test", ret_gt=True)
+        _, s_cf, _ = score_anomalies(kp_cf, base.metadata, args=args, split="test", ret_gt=True)
+        s_int = s_real - s_cf            # the vehicle's effect on pedestrian likelihood
+        assert len(proximity) == len(s_real) == len(gt)
+        print("\n=== Counterfactual interaction probe (vehicle removed = zeroed context) ===")
+        print(f"{'variant':<26}{'full AUROC':>12}{'veh-hazard':>12}{'prox rho':>10}")
+        for name, s in [("with context (real)", s_real),
+                        ("vehicle removed (cf)", s_cf),
+                        ("interaction (real-cf)", s_int)]:
+            m = hazard_subset_metrics(s, gt, proximity, tau=3.0)
+            rho = score_proximity_correlation(s, proximity, gt)["spearman"]
+            print(f"{name:<26}{m['full']['auroc']:>12.4f}"
+                  f"{m['vehicle_hazard']['auroc']:>12.4f}{rho:>10.3f}")
+        print("\nReading: if 'interaction (real-cf)' carries real vehicle-hazard "
+              "AUROC and proximity rho, the\ncontext encodes pedestrian-vehicle "
+              "interaction beyond object presence; if ~chance, the gain\nis not "
+              "interaction-specific.")
+        return
+
+    scores_kp = (score_test_scene(model, loader, a.device, a.scene_readout) if is_scene
+                 else score_test(model, loader, a.device, is_ctx))
+    auc, scores, gt = score_anomalies(scores_kp, base.metadata, args=args, split="test",
+                                      ret_gt=True, sigma=a.sigma)
+    print(f"[eval] full-set AUROC (seeker scorer, sigma={a.sigma}): {auc:.4f}")
     assert len(proximity) == len(scores) == len(gt), (len(proximity), len(scores), len(gt))
+
+    # balanced near-vehicle metric (W8): 50/50 normal vs anomalous among near frames
+    from ccskde.eval.hazard import balanced_hazard_auroc
+    bal = balanced_hazard_auroc(scores, gt, proximity, tau=3.0)
 
     print("\n=== Hazard-subset metrics ===")
     for t in a.taus:
@@ -222,6 +260,8 @@ def main():
         print(f"  tau={t:5.1f} frac_near={m['frac_near']:.3f} | "
               f"interaction AUROC={ir['auroc']:.4f} (n={ir['n']}) | "
               f"vehicle_hazard AUROC={vh['auroc']:.4f} (n_pos={vh['n_pos']})")
+    print(f"  balanced near-vehicle AUROC (tau=3): {bal['auroc']:.4f} "
+          f"[{bal['lo']:.4f}, {bal['hi']:.4f}] 95% CI, n_per_class={bal['n_per_class']}")
     corr = score_proximity_correlation(scores, proximity, gt, anomalous_only=True)
     print(f"\n  score-vs-proximity (anomalous frames): "
           f"spearman={corr['spearman']:.3f} pearson={corr['pearson']:.3f} n={corr['n']}")

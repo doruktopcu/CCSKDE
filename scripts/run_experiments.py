@@ -135,12 +135,12 @@ def make_loader(ds, args, shuffle):
                       pin_memory=True, shuffle=shuffle)
 
 
-def run_config(name, cfg, base, args, a, writer):
-    torch.manual_seed(a.seed)
-    np.random.seed(a.seed)
+def run_config(name, cfg, base, args, a, writer, seed, dir_suffix=""):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
     n_kp = 2 * 18 * args.seg_len
     hidden = args.n_layers * [args.expansion_factor * (n_kp - 2)]
-    args.ckpt_dir = create_exp_dirs(args.exp_dir, dirmap=f"{args.dataset}_{name}")
+    args.ckpt_dir = create_exp_dirs(args.exp_dir, dirmap=f"{args.dataset}_{name}{dir_suffix}")
 
     if cfg["kind"] == "baseline":
         model = PartialAutoregressiveFC(dim=n_kp, hidden_dims=hidden, droppout=args.droppout)
@@ -204,6 +204,8 @@ def plot(results, out_png):
         return
     plt.figure(figsize=(8, 5))
     for name, r in results.items():
+        if "aucs" not in r:
+            continue
         plt.plot(range(1, len(r["aucs"]) + 1), r["aucs"], marker="o", label=name)
     plt.xlabel("epoch"); plt.ylabel("validation AUROC")
     plt.title("CCSKDE — ShanghaiTech validation AUROC"); plt.legend(); plt.grid(alpha=0.3)
@@ -222,6 +224,8 @@ def main():
     ap.add_argument("--seg_len", type=int, default=24)
     ap.add_argument("--seg_stride", type=int, default=1)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--seeds", type=int, nargs="+", default=None,
+                    help="multiple seeds -> per-config mean±std (W3). Overrides --seed.")
     ap.add_argument("--num_workers", type=int, default=0)
     ap.add_argument("--max_vehicles", type=int, default=2)
     ap.add_argument("--kv", type=int, default=6)
@@ -249,13 +253,29 @@ def main():
     args = build_args(a)
     base = load_base(args)
     writer = SummaryWriter(log_dir=os.path.join(a.out, "tb"))
+    seeds = a.seeds if a.seeds else [a.seed]
+    multi = len(seeds) > 1
 
     for name in todo:
-        print("\n" + "=" * 70 + f"\n  {name}\n" + "=" * 70)
-        results[name] = run_config(name, CONFIGS[name], base, args, a, writer)
+        print("\n" + "=" * 70 + f"\n  {name}  (seeds={seeds})\n" + "=" * 70)
+        per_seed = []
+        for seed in seeds:
+            suffix = f"_s{seed}" if multi else ""
+            per_seed.append(run_config(name, CONFIGS[name], base, args, a, writer, seed, suffix))
+        if not multi:
+            results[name] = per_seed[0]
+        else:
+            bests = [r["best"] for r in per_seed]
+            means = [r["mean"] for r in per_seed]
+            results[name] = dict(
+                per_seed=per_seed, seeds=seeds, aucs=per_seed[0]["aucs"],
+                best_mean=float(np.mean(bests)), best_std=float(np.std(bests)),
+                mean_mean=float(np.mean(means)), mean_std=float(np.std(means)))
+            print(f"[{name}] best {np.mean(bests):.4f}±{np.std(bests):.4f} | "
+                  f"mean {np.mean(means):.4f}±{np.std(means):.4f}  over {len(seeds)} seeds")
         # persist after each config so a crash never loses completed runs
         meta = dict(epochs=a.epochs, batch_size=a.batch_size, seg_len=a.seg_len,
-                    seg_stride=a.seg_stride, seed=a.seed,
+                    seg_stride=a.seg_stride, seeds=seeds,
                     max_vehicles=a.max_vehicles, kv=a.kv,
                     device=a.device, gpu=(torch.cuda.get_device_name(0)
                                           if torch.cuda.is_available() else "cpu"))

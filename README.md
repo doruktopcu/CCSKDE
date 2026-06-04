@@ -42,7 +42,7 @@ captured by the cross-agent conditioning — not by hand-crafted features.
 3. **FiLM covariance modulation** — context gates the predicted covariance
    (the "contextual covariance penalty"), realised as a zero-initialised FiLM
    head; autoregressive structure provably preserved.
-4. **Unified Scene-SKDE** — cars modelled as first-class skeletal agents in one
+4. **Unified Scene-SKDE** — cars modelled as first-class agents (oriented-keypoint sets, *not* articulated skeletons) in one
    joint density (the single-formula model above). To our knowledge the first
    time SeeKer's keypoint density is taken beyond a single human skeleton.
 5. **Honest hazard-subset evaluation** — isolates pedestrian-vehicle events and
@@ -57,7 +57,7 @@ captured by the cross-agent conditioning — not by hand-crafted features.
 |---|---|---|
 | SeeKer baseline | 0.735 | 0.720 |
 | CCSKDE proximity (coord-fixed) | **0.803** | 0.786 |
-| CCSKDE car-matrix (vehicle skeleton) | 0.802 | 0.786 |
+| CCSKDE car-matrix (oriented vehicle keypoints) | 0.802 | 0.786 |
 | CCSKDE car-matrix + FiLM | 0.797 | **0.790** |
 | car-matrix, shuffled context (control) | 0.789 | 0.784 |
 | **Unified Scene-SKDE** | 0.798 | 0.786 |

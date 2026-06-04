@@ -81,6 +81,32 @@ def score_proximity_correlation(
     return dict(spearman=float(rho), pearson=pear, n=int(mask.sum()))
 
 
+def balanced_hazard_auroc(scores, gt, proximity, tau, n_boot=1000, seed=0):
+    """W8 fix: AUROC of normal vs anomalous *within near-vehicle frames*, but
+    class-balanced (the raw near-vehicle subset is ~91% positive on ShanghaiTech,
+    which makes plain AUROC unstable). We balance by subsampling to the minority
+    count and bootstrap a 95% CI so the small negative set's uncertainty is
+    explicit."""
+    rng = np.random.default_rng(seed)
+    near = np.asarray(proximity, dtype=np.float64) >= tau
+    s = np.asarray(scores, dtype=np.float64)[near]
+    y = np.asarray(gt, dtype=np.int32)[near]
+    pos, neg = np.where(y == 1)[0], np.where(y == 0)[0]
+    k = int(min(len(pos), len(neg)))
+    if k < 5:
+        return dict(auroc=float("nan"), lo=float("nan"), hi=float("nan"), n_per_class=k)
+    aucs = []
+    for _ in range(n_boot):
+        idx = np.concatenate([rng.choice(pos, k, replace=True),
+                              rng.choice(neg, k, replace=True)])
+        yy, ss = y[idx], s[idx]
+        if yy.min() != yy.max():
+            aucs.append(roc_auc_score(yy, ss))
+    aucs = np.asarray(aucs)
+    return dict(auroc=float(aucs.mean()), lo=float(np.percentile(aucs, 2.5)),
+                hi=float(np.percentile(aucs, 97.5)), n_per_class=k)
+
+
 def clip_frame_proximity(
     detections_per_frame: list,   # per-frame YOLO cache (box or oriented schema)
     ped_centroids_per_frame: dict,  # {frame_idx: list of (2,) ped centroids [0,1]}

@@ -456,3 +456,38 @@ and the ccskde→seeker bridge (`scene_dataset` → `normalize_pose`) works.
 and the patch + VENDORED.md let the submodule be re-derived if ever wanted.
 **Artifacts:** commit `026166e`, `seeker/VENDORED.md`,
 `seeker/PORTABILITY_PATCHES.patch`.
+
+### #31 — Adversarial review + Sprint 1 (review-driven fixes)
+**Date:** 2026-06-04
+**Type:** research + code + doc
+**Summary:** Wrote a harsh from-scratch reviewer assessment (weaknesses W1–W12;
+verdict Reject→Major-Revision) and a 10-direction ideation, then created
+`ROADMAP.md` (Sprint 1 / Ambitious / Ultra) and executed **Sprint 1** (8 items).
+(Note: a file the user supplied as the SeeKer source was actually a different
+paper, "POINTS-Seeker"; review was grounded in the real SeeKer — arXiv 2506.18368
++ vendored code. Verified SeeKer facts: datasets UBnormal/ShanghaiTech(+HR)/MSAD-HR
+— *not* Avenue; ShanghaiTech 85.5; full-cov $\approx$ diagonal 77.8 vs 77.9.)
+**Sprint 1 delivered:**
+- **Counterfactual interaction probe** (`evaluate_hazard.py --counterfactual`,
+  W1/W2): zeroing context → near-baseline (0.741 / veh-hazard 0.79 / ρ 0.15); the
+  isolated interaction term (real−cf) → veh-hazard AUROC **0.967**, ρ **0.70**,
+  but full-AUROC only 0.69 — i.e. the gain is **interaction-specific, not generic
+  capacity or a constant presence offset**. Strong rebuttal to W1.
+- **Balanced near-vehicle AUROC** (bootstrap, W8): **0.62 [0.59, 0.66]** — above
+  chance after removing the ~91% positive imbalance (`balanced_hazard_auroc`).
+- **Efficiency** (`scripts/measure_efficiency.py`, W11): 2.24/2.97/6.22 M params,
+  0.30/0.41/0.72 ms/batch, >3e7 frame-scores/s on RTX 5080.
+- **Multi-seed harness** (`run_experiments.py --seeds`, W3 capability):
+  per-config mean±std aggregation.
+- **Joint readout default** for the scene model (W6); **terminology** corrected
+  ("oriented bounding box rendered as keypoints", not a skeleton, W7); report
+  gains **related-work positioning** (ComplexVAD'25, Wiederer'22) + a
+  **scope/theory** paragraph (W12) + the counterfactual/efficiency results; and
+  **SeeKer facts** fixed (datasets, full-cov≈diagonal → drop full-cov roadmap).
+**Deferred (Ambitious/Ultra in ROADMAP.md):** reproduce baseline ≈0.855 (W4),
+full multi-seed + significance (W3), ablations (W9), perception robustness (W10),
+flow/diffusion conditional, joint crowd-SKDE, second dataset MSAD-HR (W5),
+universal-keypoint / animal extensions.
+**Artifacts:** `ROADMAP.md`, `scripts/measure_efficiency.py`,
+`scripts/evaluate_hazard.py` (+counterfactual, joint default), `ccskde/eval/hazard.py`
+(+balanced), `scripts/run_experiments.py` (+seeds), `report/main.tex`.

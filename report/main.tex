@@ -153,6 +153,21 @@ no prior work has injected an explicit, per-frame proximity-to-non-pedestrian
 context vector into an autoregressive keypoint density estimator; this is
 the gap our work addresses.
 
+\paragraph{Multi-agent and interaction anomalies.}
+Closest in spirit are methods that model \emph{interactions} among actors.
+\citet{wiederer2022anomaly} learn a density over multiple road-agent
+trajectories and flag low-density configurations, and ComplexVAD
+\citep{complexvad2025} explicitly targets ``complex'' anomalies arising from the
+interaction of two or more objects (e.g.\ a cyclist colliding with a car). These
+operate on trajectory- or graph-level features. Our contribution is orthogonal
+in mechanism: we retain SeeKer's autoregressive \emph{keypoint-level} density but
+widen its support from a single human skeleton to a heterogeneous set of road
+agents, so that a pedestrian's per-keypoint likelihood is conditioned on the
+surrounding vehicles within \emph{one} factorised density. To our knowledge this
+is the first multi-agent extension of an autoregressive keypoint density
+estimator. We emphasise that the vehicle representation is an oriented bounding
+box rendered as keypoints, not an articulated skeleton (Section~\ref{ssec:ccskde}).
+
 \paragraph{Object detection, datasets and pose extraction.}
 We use YOLOv11~\citep{ultralytics2024yolov11} for one-time offline detection
 of non-pedestrian scene elements; its bounding boxes are aggregated into
@@ -197,8 +212,9 @@ publicly released implementation we build on --- the covariance is
 log-variance for each coordinate, so the negative log-likelihood reduces to a
 per-coordinate Mahalanobis term plus a log-variance penalty. (SeeKer
 additionally \emph{ablates} a full $2\times2$ covariance through a Cholesky
-factor $\Sigma_{\theta}^{-1}=L_{\theta}L_{\theta}^{\!\top}$; we retain the
-diagonal form that matches the released code and instead make the variance
+factor $\Sigma_{\theta}^{-1}=L_{\theta}L_{\theta}^{\!\top}$, but reports it to
+perform on par with the diagonal form ($77.8$ vs.\ $77.9$ on UBnormal); we
+therefore retain the diagonal parameterisation and instead make the variance
 \emph{context-dependent}, Section~\ref{ssec:ccskde}.) The keypoint-level
 autoregressive constraint is enforced by binary masks on the weight matrices,
 exactly as in MADE~\citep{germain2015made}; SeeKer adapts the masking so that
@@ -282,11 +298,14 @@ translation- and scale-invariant (directly addressing challenge~iii). The
 resulting fixed-dimension ``car matrix''
 $C_t\in\mathbb{R}^{M(2K_v+2)}$ (corners, centre, heading per vehicle, plus an
 inverse-distance and a class index) replaces the proximity vector while using
-the identical injection machinery below. Dedicated vehicle-keypoint networks
-exist (e.g.\ SKoPe3D) but are trained on synthetic frontal views and do not
-transfer to surveillance cameras; the segmentation-derived oriented skeleton
-is the lightweight, off-the-shelf choice consistent with our compute
-envelope.
+the identical injection machinery below. We stress that this is an
+\emph{oriented bounding box} expressed as keypoints (corners, centre, heading),
+\emph{not} an articulated/anatomical skeleton: we use the word ``skeleton'' only
+by analogy to the pedestrian's keypoints, and the representation carries no
+vehicle parts or kinematics. Dedicated vehicle-keypoint networks exist (e.g.\
+SKoPe3D) but are trained on synthetic frontal views and do not transfer to
+surveillance cameras; the segmentation-derived oriented box is the lightweight,
+off-the-shelf choice consistent with our compute envelope.
 
 \paragraph{Injection into the autoregressive backbone.}
 Naively concatenating $C_t$ to the MADE input would interfere with the
@@ -373,6 +392,18 @@ masked network is the same MADE with its keypoint count generalised from $18$ to
 $N'$; we verify by an autograd Jacobian sweep that no keypoint sees an
 equal-or-later keypoint of the same frame, while pedestrian keypoints \emph{can}
 attend to the vehicle keypoints (the interaction pathway).
+
+\paragraph{What the joint density can and cannot capture.}
+Because the factorisation conditions each pedestrian keypoint on the
+(earlier-ordered) vehicle keypoints of the current frame and on the past window
+$Z_\Delta$, the model can learn that a pedestrian configuration is likely or
+unlikely \emph{given} the vehicle layout --- first-order pedestrian--vehicle
+interaction. It does \emph{not} model higher-order multi-agent dynamics, and
+with a diagonal per-keypoint Gaussian each conditional is unimodal: genuinely
+multimodal normal behaviour (e.g.\ a pedestrian who may pass to either side of a
+parked car) can only be approximated. A more expressive conditional is the
+natural remedy (Section~\ref{sec:experiments}, future work). This scope is what
+the experiments are designed to probe.
 
 \subsection{Training and evaluation protocol}
 \label{ssec:protocol}
@@ -462,7 +493,7 @@ Model & Best AUROC & Mean AUROC \\
 \midrule
 SeeKer (baseline) & 0.7351 & 0.7204 \\
 CCSKDE proximity (corrected) & \textbf{0.8034} & 0.7857 \\
-CCSKDE car-matrix (vehicle skeleton) & 0.8023 & 0.7855 \\
+CCSKDE car-matrix (oriented vehicle keypoints) & 0.8023 & 0.7855 \\
 CCSKDE car-matrix + FiLM covariance & 0.7971 & \textbf{0.7898} \\
 \;\;\emph{car-matrix, shuffled ctx (control)} & 0.7893 & 0.7835 \\
 \midrule
@@ -530,6 +561,29 @@ near-vehicle-hazard AUROC to $0.965$; the unified scene model behaves similarly
 fire specifically when a pedestrian is in a vehicle's vicinity --- the behaviour
 the proposal set out to obtain.
 
+\paragraph{Interaction vs.\ mere presence: a counterfactual probe.}
+A natural worry is that the gain reflects generic added capacity, or a constant
+``a-vehicle-is-present'' offset, rather than interaction. We test this by scoring
+each frame with the real context and again with the context \emph{zeroed} (the
+vehicle ``removed''), and isolating the difference. Zeroing the context collapses
+the model to near-baseline behaviour (full AUROC $0.741$, vehicle-hazard $0.79$,
+$\rho{=}0.15$). The isolated interaction term (real $-$ counterfactual) is, by
+contrast, a near-perfect \emph{vehicle-hazard} detector (AUROC $0.967$,
+$\rho{=}0.70$) yet only a weak \emph{general} detector (full AUROC $0.69$) --- the
+signature of a configuration-dependent interaction signal, not a constant
+presence offset. A class-balanced within-near-vehicle AUROC (bootstrap) is
+$0.62\,[0.59,0.66]$, significantly above chance after removing the $\sim\!91\%$
+label imbalance. The full disentanglement (benign vs.\ dangerous near-vehicle
+configurations) requires a dataset where vehicles are sometimes normal, which we
+leave to future cross-dataset work.
+
+\paragraph{Efficiency.}
+The density models are lightweight: $2.24$M (baseline), $2.97$M (car-matrix +
+FiLM), and $6.22$M (scene) parameters, with single-batch forward latencies of
+$0.30$/$0.41$/$0.72$\,ms ($>\!3\times10^{7}$ frame-scores/s) on one RTX~5080.
+Perception (YOLO-seg, AlphaPose) is a one-time offline cost and adds nothing at
+train or inference time.
+
 \paragraph{Limitations.}
 (i) Numbers are single-seed; the high baseline variance means multi-seed runs
 would tighten the comparison. (ii) On ShanghaiTech a vehicle near a pedestrian
@@ -542,9 +596,15 @@ keypoints raises the proximity correlation and is the natural route to flagging
 vehicle-intrinsic hazards (e.g.\ a car driven into a pedestrian zone).
 
 \paragraph{Future work.}
-Open-vocabulary road elements (crosswalks, signs) as additional scene
-keypoints; a full $2{\times}2$ context-rotated covariance; multi-seed and
-cross-dataset (ShanghaiTech-HR, UBnormal) evaluation.
+Multi-seed runs with significance tests against a fully reproduced baseline;
+cross-dataset evaluation on \textbf{UBnormal} and \textbf{MSAD-HR} (SeeKer's own
+benchmarks beyond ShanghaiTech --- MSAD-HR is especially valuable because
+vehicles there can be \emph{normal}, which would separate genuine interaction
+hazard from mere object presence); a more expressive per-keypoint conditional
+(normalizing flow / diffusion) rather than richer covariance (SeeKer's ablation
+shows full $2{\times}2$ covariance $\approx$ diagonal, so expressivity must come
+from the conditional, not the covariance form); and open-vocabulary road
+elements (crosswalks, signs) as additional scene keypoints.
 
 % -----------------------------------------------------------------------------
 \bibliographystyle{iclr2025_conference}
@@ -617,6 +677,16 @@ Morais, R., Le, V., Tran, T., Saha, B., Mansour, M., \& Venkatesh, S. (2019).
 \newblock Learning Regularity in Skeleton Trajectories for Anomaly Detection
 in Videos.
 In {\em CVPR}.
+
+\bibitem[Doshi \& Yilmaz(2025)]{complexvad2025}
+Doshi, K., \& Yilmaz, Y. (2025).
+\newblock ComplexVAD: Detecting Interaction Anomalies in Video.
+\newblock In {\em WACV}.
+
+\bibitem[Wiederer et~al.(2022)]{wiederer2022anomaly}
+Wiederer, J., Bouazizi, A., Troina, M., Kressel, U., \& Belagiannis, V. (2022).
+\newblock Anomaly Detection in Multi-Agent Trajectories for Automated Driving.
+\newblock In {\em CoRL}.
 
 \bibitem[Perez et~al.(2018)]{perez2018film}
 Perez, E., Strub, F., de~Vries, H., Dumoulin, V., \& Courville, A. (2018).
