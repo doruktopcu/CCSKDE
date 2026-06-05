@@ -1,0 +1,115 @@
+% =============================================================================
+% DRAFT: reframed contributions + results for the CMP719 final report.
+% Honest framing per the smoothing finding: claim the INTERACTION signal +
+% multi-agent generalization, NOT a global-AUROC improvement.
+%
+% Placeholders \PE{...} are the two pending 5-seed numbers (vehicle, shuffled).
+% Fill them the moment those configs finish, then integrate into main.tex.
+%   \PE{veh-mean}  \PE{veh-best}  \PE{shuf-mean}  \PE{shuf-best}
+%   \PE{dvb}   = vehicle_mean - baseline_mean  (pp)
+%   \PE{dvs}   = vehicle_mean - shuffled_mean  (pp)
+% Define once near the top of main.tex:
+%   \newcommand{\PE}[1]{\textcolor{red}{\textbf{[#1]}}}
+% =============================================================================
+
+% ----------------------------------------------------------------- CONTRIBUTIONS
+\paragraph{Contributions.}
+We extend the Sequential Keypoint Density Estimator (SeeKer) and frame our claims
+strictly around what the evidence supports:
+\begin{itemize}
+  \item \textbf{Scene-SKDE: a multi-agent keypoint density.} We generalise
+  SeeKer's autoregressive density from a \emph{single} human skeleton to a
+  \emph{joint scene} of road agents. Each vehicle is encoded as a compact
+  oriented-keypoint set (four oriented corners, centre, and a heading point,
+  obtained from a YOLOv11-segmentation mask) and concatenated with the pedestrian
+  skeleton, so all $N'{=}18{+}6M$ keypoints are modelled under one factorisation
+  with the pedestrian predicted \emph{given} the surrounding vehicles. To our
+  knowledge this is the first multi-agent extension of this estimator.
+  \item \textbf{Context-conditioned variant with FiLM covariance.} As a lighter
+  alternative we inject the vehicle geometry as a per-frame context (a per-class
+  proximity vector, or the richer oriented ``car matrix'') through an
+  autoregressive-preserving shortcut, and add a FiLM head that lets the context
+  modulate the predicted covariance --- a concrete realisation of the proposal's
+  ``contextual covariance penalty''.
+  \item \textbf{Evidence that the gain is interaction, not object presence.}
+  Through a counterfactual probe --- re-scoring each frame with the vehicle
+  ``removed'' (context zeroed) --- we isolate the vehicle's effect on the
+  pedestrian likelihood and show it is a configuration-dependent
+  \emph{interaction} signal that the pedestrian-only baseline structurally cannot
+  produce: the isolated interaction term reaches a near-vehicle-hazard AUROC of
+  $0.97$ and lifts the score--proximity correlation from $0.16$ to $0.70$.
+  \item \textbf{Honest, multi-seed evaluation.} We report mean$\pm$std over five
+  seeds, a hazard-subset analysis, and a careful negative result: the
+  \emph{overall}-AUROC advantage is operating-point-sensitive --- it narrows
+  under temporal score smoothing --- so we claim a pedestrian-vehicle
+  \emph{interaction} signal, not a global AUROC improvement.
+\end{itemize}
+
+% --------------------------------------------------------------- RESULTS: TABLES
+\begin{table}[h]
+\centering
+\caption{ShanghaiTech validation AUROC, \textbf{mean$\pm$std over 5 seeds}
+(10 epochs, batch 1024, seg-len 24, stride 1). ``Best'' is the per-seed
+best-epoch value (high variance); ``Mean'' is the per-seed epoch-mean
+(stable). We compare on \emph{Mean}.}
+\label{tab:multiseed}
+\begin{tabular}{lcc}
+\toprule
+Model & Best AUROC & Mean AUROC \\
+\midrule
+SeeKer baseline & $0.756 \pm 0.018$ & $0.725 \pm 0.004$ \\
+CCSKDE car-matrix (oriented vehicle kpts) & $\PE{veh-best}$ & $\PE{veh-mean}$ \\
+\;\;\emph{shuffled-context control} & $\PE{shuf-best}$ & $\PE{shuf-mean}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% --------------------------------------------------------- RESULTS: PARAGRAPHS
+\paragraph{Overall AUROC, with error bars.}
+Across five seeds the baseline's per-epoch \emph{mean} AUROC is a tight
+$0.725\pm0.004$, whereas its per-seed \emph{best} swings by $\pm0.018$ (range
+$0.735$--$0.785$). This alone is instructive: single-seed ``best'' comparisons of
+$\sim$1\,pp --- on which earlier skeleton-VAD reproductions often rest --- lie
+\emph{entirely within} this epoch-to-epoch noise, so we compare on the stable
+\emph{mean}. The car-matrix model attains a mean of $\PE{veh-mean}$, a
+$\PE{dvb}$\,pp change over baseline; given the $\pm0.004$ baseline spread this is
+\PE{significant/within noise}.
+
+\paragraph{Is the spatial alignment real? A shuffled-context control.}
+Permuting the context across segments (identical parameter count, but
+geometry deliberately misaligned with the pedestrian) gives a mean of
+$\PE{shuf-mean}$. The aligned-minus-shuffled gap is $\PE{dvs}$\,pp; it
+\PE{exceeds / falls within} the seed-level noise, so we \PE{retain / soften} the
+claim that the \emph{spatial alignment} of the context --- not merely the extra
+structured input --- carries the signal.
+
+\paragraph{The interaction signal (our primary result).}
+Overall AUROC mixes motion-intrinsic anomalies (running, fighting) with the
+context-dependent ones we target, and therefore understates the contribution. We
+isolate the latter with a counterfactual: scoring each frame with the real
+context and again with the context zeroed (vehicle ``removed''). Zeroing collapses
+the model to near-baseline behaviour (full AUROC $0.741$, vehicle-hazard $0.79$,
+score--proximity $\rho{=}0.15$). The isolated interaction term (real minus
+counterfactual) is, in contrast, a near-perfect \emph{vehicle-hazard} detector
+(AUROC $0.967$, $\rho{=}0.70$) yet only a weak \emph{general} detector
+(full AUROC $0.69$) --- the signature of a configuration-dependent interaction
+signal rather than a constant ``object-present'' offset. A class-balanced
+within-near-vehicle AUROC (bootstrap) of $0.62\,[0.59,0.66]$ confirms the model
+separates dangerous from benign near-vehicle frames above chance even after
+removing the $\sim$91\%\ positive-label imbalance.
+
+\paragraph{An honest caveat: operating-point sensitivity.}
+ShanghaiTech AUROC is sensitive to temporal smoothing of the per-frame score. At
+the baseline's best operating point ($\sigma{=}20$) the baseline rises to
+$0.757$ while the car-matrix model --- whose interaction signal is temporally
+\emph{punctate} --- falls to $0.765$, so the \emph{overall}-AUROC gap narrows to
+$\sim$1\,pp. We report this rather than tuning the operating point in our favour:
+the defensible claim is comparable overall AUROC \emph{plus} a distinct
+interaction signal, not a global AUROC win.
+
+\paragraph{Efficiency.}
+The density models are lightweight: $2.24$/$2.97$/$6.22$\,M parameters
+(baseline / car-matrix$+$FiLM / scene) with single-batch forward latencies of
+$0.30$/$0.41$/$0.72$\,ms ($>\!3\times10^{7}$ frame-scores/s) on one RTX~5080.
+Perception (YOLO-seg, AlphaPose) is a one-time offline cost, adding nothing at
+train or inference time.

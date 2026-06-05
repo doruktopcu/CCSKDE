@@ -25,6 +25,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import sys
@@ -135,60 +136,72 @@ def make_loader(ds, args, shuffle):
                       pin_memory=True, shuffle=shuffle)
 
 
-def run_config(name, cfg, base, args, a, writer, seed, dir_suffix=""):
+def build_loaders(name, cfg, base, args, a):
+    """Build datasets + loaders for a config ONCE (including the heavy
+    precompute), so they are REUSED across all seeds. This is the fix for the
+    per-seed memory leak: the context is seed-independent, so we must not
+    re-precompute (each ~3 GB) per seed. Returns a dict the per-seed trainer
+    consumes; call `del` on it after the config to free the precompute."""
+    if cfg["kind"] == "baseline":
+        return dict(kind="baseline", meta=base["test"].metadata,
+                    tr=make_loader(base["train"], args, shuffle=True),
+                    te=make_loader(base["test"], args, shuffle=False))
+    if cfg["kind"] == "scene":
+        spec = ContextSpec(mode="vehicle", max_vehicles=a.max_vehicles, kv=a.kv)
+        n_prime = PED_KP + a.max_vehicles * a.kv
+        ds = {s: SceneSkeletonDataset(base[s], os.path.join(a.oriented_cache, s), spec=spec).precompute()
+              for s in ("train", "test")}
+        return dict(kind="scene", ds=ds, n_prime=n_prime, meta=ds["test"].metadata,
+                    tr=make_loader(ds["train"], args, shuffle=True),
+                    te=make_loader(ds["test"], args, shuffle=False))
+    spec = ContextSpec(mode=cfg["mode"], max_vehicles=a.max_vehicles, kv=a.kv)
+    cache_root = a.oriented_cache if cfg["cache"] == "oriented" else a.proximity_cache
+    ds = {s: ContextualSkeletonSequenceDataset(base[s], os.path.join(cache_root, s), spec=spec).precompute()
+          for s in ("train", "test")}
+    return dict(kind="context", ds=ds, spec=spec, film=cfg.get("film", False),
+                shuffled=cfg.get("shuffled", False), meta=ds["test"].metadata,
+                tr=make_loader(ds["train"], args, shuffle=True),
+                te=make_loader(ds["test"], args, shuffle=False))
+
+
+def train_one_seed(name, L, args, a, writer, seed, dir_suffix=""):
+    """Train one seed reusing the shared loaders in L. Frees the model/optimizer
+    (not the loaders) at the end."""
     torch.manual_seed(seed)
     np.random.seed(seed)
     n_kp = 2 * 18 * args.seg_len
     hidden = args.n_layers * [args.expansion_factor * (n_kp - 2)]
     args.ckpt_dir = create_exp_dirs(args.exp_dir, dirmap=f"{args.dataset}_{name}{dir_suffix}")
+    opt = init_optimizer(args.model_optimizer, lr=args.model_lr)
 
-    if cfg["kind"] == "baseline":
+    if L["kind"] == "baseline":
         model = PartialAutoregressiveFC(dim=n_kp, hidden_dims=hidden, droppout=args.droppout)
-        tr = make_loader(base["train"], args, shuffle=True)
-        te = make_loader(base["test"], args, shuffle=False)
-        trainer = BaselineTrainer(args, model, tr, te, te,
-                                  base["test"].metadata, base["test"].metadata,
-                                  optimizer_f=init_optimizer(args.model_optimizer, lr=args.model_lr),
-                                  log_writer=writer, dataset=args.dataset)
-    elif cfg["kind"] == "scene":
-        spec = ContextSpec(mode="vehicle", max_vehicles=a.max_vehicles, kv=a.kv)
-        n_prime = PED_KP + a.max_vehicles * a.kv
-        ds = {s: SceneSkeletonDataset(base[s], os.path.join(a.oriented_cache, s), spec=spec).precompute()
-              for s in ("train", "test")}
-        tr = make_loader(ds["train"], args, shuffle=True)
-        te = make_loader(ds["test"], args, shuffle=False)
-        n_in = 2 * n_prime * args.seg_len
+        trainer = BaselineTrainer(args, model, L["tr"], L["te"], L["te"], L["meta"], L["meta"],
+                                  optimizer_f=opt, log_writer=writer, dataset=args.dataset)
+    elif L["kind"] == "scene":
+        n_in = 2 * L["n_prime"] * args.seg_len
         hidden_scene = args.n_layers * [args.expansion_factor * (n_in - 2)]
-        model = PartialAutoregressiveSceneFC(dim=n_in, n_current_kp=n_prime,
+        model = PartialAutoregressiveSceneFC(dim=n_in, n_current_kp=L["n_prime"],
                                              hidden_dims=hidden_scene, droppout=args.droppout)
-        trainer = SceneTrainer(args, model, tr, te, te,
-                               ds["test"].metadata, ds["test"].metadata,
-                               optimizer_f=init_optimizer(args.model_optimizer, lr=args.model_lr),
-                               log_writer=writer, dataset=args.dataset)
+        trainer = SceneTrainer(args, model, L["tr"], L["te"], L["te"], L["meta"], L["meta"],
+                               optimizer_f=opt, log_writer=writer, dataset=args.dataset)
     else:
-        spec = ContextSpec(mode=cfg["mode"], max_vehicles=a.max_vehicles, kv=a.kv)
-        cache_root = a.oriented_cache if cfg["cache"] == "oriented" else a.proximity_cache
-        ds = {s: ContextualSkeletonSequenceDataset(base[s], os.path.join(cache_root, s), spec=spec).precompute()
-              for s in ("train", "test")}
-        tr = make_loader(ds["train"], args, shuffle=True)
-        te = make_loader(ds["test"], args, shuffle=False)
         model = PartialAutoregressiveContextFC(
-            dim=n_kp, ctx_dim=spec.dim * args.seg_len, hidden_dims=hidden,
-            droppout=args.droppout, film_cov=cfg.get("film", False))
-        trainer = CCSKDETrainer(args, model, tr, te, te,
-                                ds["test"].metadata, ds["test"].metadata,
-                                optimizer_f=init_optimizer(args.model_optimizer, lr=args.model_lr),
-                                log_writer=writer, dataset=args.dataset,
-                                shuffled_context=cfg.get("shuffled", False))
+            dim=n_kp, ctx_dim=L["spec"].dim * args.seg_len, hidden_dims=hidden,
+            droppout=args.droppout, film_cov=L["film"])
+        trainer = CCSKDETrainer(args, model, L["tr"], L["te"], L["te"], L["meta"], L["meta"],
+                                optimizer_f=opt, log_writer=writer, dataset=args.dataset,
+                                shuffled_context=L["shuffled"])
     t0 = time.time()
     trainer.train()
     dt = time.time() - t0
     aucs = [trainer.all_val_auc[e] for e in sorted(trainer.all_val_auc)]
     res = dict(aucs=aucs, best=max(aucs), best_epoch=int(np.argmax(aucs)),
                mean=float(np.mean(aucs)), minutes=round(dt / 60, 1))
-    print(f"[{name}] best={res['best']:.4f}@{res['best_epoch']} "
+    print(f"[{name} seed={seed}] best={res['best']:.4f}@{res['best_epoch']} "
           f"mean={res['mean']:.4f} ({res['minutes']}min)")
-    del model, trainer
+    del model, trainer, opt
+    gc.collect()
     if args.device.startswith("cuda"):
         torch.cuda.empty_cache()
     return res
@@ -258,10 +271,15 @@ def main():
 
     for name in todo:
         print("\n" + "=" * 70 + f"\n  {name}  (seeds={seeds})\n" + "=" * 70)
+        L = build_loaders(name, CONFIGS[name], base, args, a)   # precompute ONCE
         per_seed = []
         for seed in seeds:
             suffix = f"_s{seed}" if multi else ""
-            per_seed.append(run_config(name, CONFIGS[name], base, args, a, writer, seed, suffix))
+            per_seed.append(train_one_seed(name, L, args, a, writer, seed, suffix))
+        del L                                                   # free precompute
+        gc.collect()
+        if a.device.startswith("cuda"):
+            torch.cuda.empty_cache()
         if not multi:
             results[name] = per_seed[0]
         else:
