@@ -99,13 +99,16 @@ CONFIGS = {
     "vehicle_shuffled":  dict(kind="context", mode="vehicle",   cache="oriented", shuffled=True),
     # unified scene-SKDE: cars are extra skeletal joints in one density
     "scene":             dict(kind="scene",   cache="oriented"),
+    # ablation: pedestrian ordered FIRST (vehicles after) -> removes the
+    # pedestrian-given-vehicles conditioning at identical capacity.
+    "scene_pedfirst":    dict(kind="scene",   cache="oriented", ped_first=True),
 }
 
 
 def build_args(a):
     parser = init_parser()
     argv = [
-        "--dataset", "ShanghaiTech", "--data_dir", a.data_dir,
+        "--dataset", a.dataset, "--data_dir", a.data_dir,
         "--device", a.device, "--epochs", str(a.epochs),
         "--batch_size", str(a.batch_size), "--seg_len", str(a.seg_len),
         "--seg_stride", str(a.seg_stride), "--seed", str(a.seed),
@@ -147,11 +150,14 @@ def build_loaders(name, cfg, base, args, a):
                     tr=make_loader(base["train"], args, shuffle=True),
                     te=make_loader(base["test"], args, shuffle=False))
     if cfg["kind"] == "scene":
-        spec = ContextSpec(mode="vehicle", max_vehicles=a.max_vehicles, kv=a.kv)
+        ped_first = cfg.get("ped_first", False)
+        spec = ContextSpec(mode="vehicle", max_vehicles=a.max_vehicles, kv=a.kv,
+                           ped_first=ped_first)
         n_prime = PED_KP + a.max_vehicles * a.kv
         ds = {s: SceneSkeletonDataset(base[s], os.path.join(a.oriented_cache, s), spec=spec).precompute()
               for s in ("train", "test")}
-        return dict(kind="scene", ds=ds, n_prime=n_prime, meta=ds["test"].metadata,
+        return dict(kind="scene", ds=ds, n_prime=n_prime, ped_first=ped_first,
+                    meta=ds["test"].metadata,
                     tr=make_loader(ds["train"], args, shuffle=True),
                     te=make_loader(ds["test"], args, shuffle=False))
     spec = ContextSpec(mode=cfg["mode"], max_vehicles=a.max_vehicles, kv=a.kv)
@@ -185,6 +191,7 @@ def train_one_seed(name, L, args, a, writer, seed, dir_suffix=""):
                                              hidden_dims=hidden_scene, droppout=args.droppout)
         trainer = SceneTrainer(args, model, L["tr"], L["te"], L["te"], L["meta"], L["meta"],
                                optimizer_f=opt, log_writer=writer, dataset=args.dataset)
+        trainer.ped_first = L.get("ped_first", False)
     else:
         model = PartialAutoregressiveContextFC(
             dim=n_kp, ctx_dim=L["spec"].dim * args.seg_len, hidden_dims=hidden,
@@ -192,6 +199,11 @@ def train_one_seed(name, L, args, a, writer, seed, dir_suffix=""):
         trainer = CCSKDETrainer(args, model, L["tr"], L["te"], L["te"], L["meta"], L["meta"],
                                 optimizer_f=opt, log_writer=writer, dataset=args.dataset,
                                 shuffled_context=L["shuffled"])
+    if getattr(a, "init_ckpt", None):
+        ck = torch.load(a.init_ckpt, map_location=args.device, weights_only=False)
+        missing, unexpected = model.load_state_dict(ck["state_dict"], strict=False)
+        print(f"[{name} seed={seed}] fine-tuning from {a.init_ckpt} "
+              f"(missing={len(missing)} unexpected={len(unexpected)})")
     t0 = time.time()
     trainer.train()
     dt = time.time() - t0
@@ -229,6 +241,11 @@ def plot(results, out_png):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", default="data")
+    ap.add_argument("--dataset", default="ShanghaiTech", choices=["ShanghaiTech", "UBnormal"],
+                    help="benchmark; UBnormal enables the cross-dataset study")
+    ap.add_argument("--init_ckpt", default=None,
+                    help="checkpoint to initialise from before training "
+                         "(fine-tuning / transfer, e.g. ShanghaiTech -> UBnormal)")
     ap.add_argument("--proximity_cache", default="colab_results/results/context_cache")
     ap.add_argument("--oriented_cache", default="data/ShanghaiTech/context_oriented")
     ap.add_argument("--device", default="cuda")
@@ -248,6 +265,10 @@ def main():
     ap.add_argument("--force", action="store_true",
                     help="re-run configs even if already present in the results file")
     a = ap.parse_args()
+
+    # auto-derive per-dataset cache paths if the user left the ShanghaiTech defaults
+    if a.dataset == "UBnormal" and a.oriented_cache == "data/ShanghaiTech/context_oriented":
+        a.oriented_cache = "data/UBnormal/context_oriented"
 
     os.makedirs(a.out, exist_ok=True)
     json_path = os.path.join(a.out, "experiment_results.json")

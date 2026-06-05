@@ -152,3 +152,209 @@ def sweep_tau(scores, gt, proximity, taus) -> list[dict]:
                         vehicle_hazard_auroc=m["vehicle_hazard"]["auroc"],
                         frac_near=m["frac_near"]))
     return out
+
+
+# =============================================================================
+# Extra report metrics (all pure numpy/scipy/sklearn — GPU-free, unit-testable)
+# =============================================================================
+
+def equal_error_rate(scores: np.ndarray, gt: np.ndarray) -> dict:
+    """Equal error rate: the operating point where FPR == FNR (1-TPR).
+
+    A single operating-point-free summary that complements AUROC; lower is
+    better. We also return the threshold and the AUROC for convenience."""
+    from sklearn.metrics import roc_curve
+    y = np.asarray(gt, dtype=np.int32)
+    s = np.asarray(scores, dtype=np.float64)
+    if y.min() == y.max():
+        return dict(eer=float("nan"), threshold=float("nan"), auroc=float("nan"))
+    fpr, tpr, thr = roc_curve(y, s)
+    fnr = 1.0 - tpr
+    i = int(np.nanargmin(np.abs(fpr - fnr)))
+    return dict(eer=float((fpr[i] + fnr[i]) / 2.0),
+                threshold=float(thr[i]),
+                auroc=float(roc_auc_score(y, s)))
+
+
+def auroc_ap(scores: np.ndarray, gt: np.ndarray) -> dict:
+    """AUROC + Average Precision (AUPRC). AP is the more honest headline under
+    class imbalance (ShanghaiTech test is ~42.5% positive), so we report both."""
+    y = np.asarray(gt, dtype=np.int32)
+    s = np.asarray(scores, dtype=np.float64)
+    if y.min() == y.max():
+        return dict(auroc=float("nan"), ap=float("nan"),
+                    base_rate=float(y.mean()), n=int(y.size))
+    return dict(auroc=float(roc_auc_score(y, s)),
+                ap=float(average_precision_score(y, s)),
+                base_rate=float(y.mean()), n=int(y.size))
+
+
+def false_alarm_at_recall(scores, gt, recall: float = 0.90) -> dict:
+    """Operationally meaningful for a hazard detector: the false-positive rate
+    when the detector catches `recall` of the true anomalies."""
+    from sklearn.metrics import roc_curve
+    y = np.asarray(gt, dtype=np.int32)
+    s = np.asarray(scores, dtype=np.float64)
+    if y.min() == y.max():
+        return dict(fpr=float("nan"), threshold=float("nan"), recall=recall)
+    fpr, tpr, thr = roc_curve(y, s)
+    idx = np.where(tpr >= recall)[0]
+    if idx.size == 0:
+        return dict(fpr=1.0, threshold=float(thr[-1]), recall=recall)
+    i = int(idx[0])
+    return dict(fpr=float(fpr[i]), threshold=float(thr[i]), recall=recall)
+
+
+# -------------------------------------------------- DeLong correlated-AUC test
+def _compute_midrank(x: np.ndarray) -> np.ndarray:
+    """Mid-ranks (ties averaged), used by the fast DeLong estimator."""
+    J = np.argsort(x)
+    Z = x[J]
+    N = len(x)
+    T = np.zeros(N, dtype=np.float64)
+    i = 0
+    while i < N:
+        j = i
+        while j < N and Z[j] == Z[i]:
+            j += 1
+        T[i:j] = 0.5 * (i + j - 1) + 1
+        i = j
+    T2 = np.empty(N, dtype=np.float64)
+    T2[J] = T
+    return T2
+
+
+def _fast_delong(predictions_sorted_transposed: np.ndarray, label_1_count: int):
+    """Fast DeLong (Sun & Xu, 2014). Returns (aucs, covariance) for k predictors
+    sharing the same ground-truth ordering (positives first)."""
+    m = label_1_count
+    n = predictions_sorted_transposed.shape[1] - m
+    pos = predictions_sorted_transposed[:, :m]
+    neg = predictions_sorted_transposed[:, m:]
+    k = predictions_sorted_transposed.shape[0]
+    tx = np.empty([k, m], dtype=np.float64)
+    ty = np.empty([k, n], dtype=np.float64)
+    tz = np.empty([k, m + n], dtype=np.float64)
+    for r in range(k):
+        tx[r, :] = _compute_midrank(pos[r, :])
+        ty[r, :] = _compute_midrank(neg[r, :])
+        tz[r, :] = _compute_midrank(predictions_sorted_transposed[r, :])
+    aucs = tz[:, :m].sum(axis=1) / m / n - (m + 1.0) / 2.0 / n
+    v01 = (tz[:, :m] - tx[:, :]) / n
+    v10 = 1.0 - (tz[:, m:] - ty[:, :]) / m
+    sx = np.cov(v01)
+    sy = np.cov(v10)
+    delongcov = sx / m + sy / n
+    return aucs, np.atleast_2d(delongcov)
+
+
+def delong_roc_test(gt: np.ndarray, scores_a: np.ndarray, scores_b: np.ndarray) -> dict:
+    """DeLong's test for two CORRELATED ROC AUCs (same frames, two models).
+
+    Returns each AUC, the AUC difference, the z statistic and a two-sided
+    p-value. This is the statistically correct way to say "model B's AUROC is
+    significantly higher than model A's" on the same test set — stronger than an
+    unpaired t-test over seed means, because it accounts for the shared samples."""
+    import scipy.stats
+    y = np.asarray(gt, dtype=np.int32)
+    order = (-y).argsort(kind="mergesort")          # positives (label 1) first
+    label_1_count = int(y.sum())
+    preds = np.vstack((np.asarray(scores_a, dtype=np.float64),
+                       np.asarray(scores_b, dtype=np.float64)))[:, order]
+    aucs, cov = _fast_delong(preds, label_1_count)
+    var = cov[0, 0] + cov[1, 1] - 2 * cov[0, 1]
+    diff = float(aucs[0] - aucs[1])
+    if var <= 0:
+        z = float("inf") if diff != 0 else 0.0
+        p = 0.0 if diff != 0 else 1.0
+    else:
+        z = diff / np.sqrt(var)
+        p = float(2 * scipy.stats.norm.sf(abs(z)))
+    return dict(auc_a=float(aucs[0]), auc_b=float(aucs[1]), diff=diff,
+                z=float(z), p_value=p)
+
+
+def paired_bootstrap_auroc(gt, scores_a, scores_b, n_boot=2000, seed=0) -> dict:
+    """Paired bootstrap of the AUROC difference (B - A) on the same frames.
+    Resamples frame indices with replacement; reports the mean diff, a 95% CI,
+    and the fraction of resamples where B>A (a bootstrap p-value)."""
+    rng = np.random.default_rng(seed)
+    y = np.asarray(gt, dtype=np.int32)
+    sa = np.asarray(scores_a, dtype=np.float64)
+    sb = np.asarray(scores_b, dtype=np.float64)
+    n = y.size
+    diffs = []
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, n)
+        yy = y[idx]
+        if yy.min() == yy.max():
+            continue
+        diffs.append(roc_auc_score(yy, sb[idx]) - roc_auc_score(yy, sa[idx]))
+    diffs = np.asarray(diffs)
+    return dict(mean_diff=float(diffs.mean()),
+                lo=float(np.percentile(diffs, 2.5)),
+                hi=float(np.percentile(diffs, 97.5)),
+                p_b_gt_a=float((diffs <= 0).mean()),  # one-sided bootstrap p
+                n_boot=int(diffs.size))
+
+
+def clustered_bootstrap_auroc_diff(gt, scores_a, scores_b, frame_counts,
+                                   n_boot=2000, seed=0) -> dict:
+    """Clip-level (block) bootstrap of the AUROC difference (B - A).
+
+    Frames within a ShanghaiTech clip are temporally correlated, so a per-frame
+    bootstrap (and DeLong) understate the variance. Here we resample whole CLIPS
+    with replacement -- the statistically honest unit -- giving a wider, more
+    defensible CI and a clip-level bootstrap p-value. `frame_counts` are the
+    per-clip frame counts in the same concatenation order as `scores`/`gt`."""
+    rng = np.random.default_rng(seed)
+    y = np.asarray(gt, dtype=np.int32)
+    sa = np.asarray(scores_a, dtype=np.float64)
+    sb = np.asarray(scores_b, dtype=np.float64)
+    offsets = np.concatenate([[0], np.cumsum(frame_counts)]).astype(int)
+    n_clips = len(frame_counts)
+    clip_idx = [np.arange(offsets[i], offsets[i + 1]) for i in range(n_clips)]
+    diffs = []
+    for _ in range(n_boot):
+        pick = rng.integers(0, n_clips, n_clips)
+        idx = np.concatenate([clip_idx[c] for c in pick])
+        yy = y[idx]
+        if yy.min() == yy.max():
+            continue
+        diffs.append(roc_auc_score(yy, sb[idx]) - roc_auc_score(yy, sa[idx]))
+    diffs = np.asarray(diffs)
+    return dict(mean_diff=float(diffs.mean()),
+                lo=float(np.percentile(diffs, 2.5)),
+                hi=float(np.percentile(diffs, 97.5)),
+                p_b_le_a=float((diffs <= 0).mean()),
+                n_boot=int(diffs.size), n_clips=int(n_clips))
+
+
+def per_scene_auroc(scores, gt, clip_keys, frame_counts) -> dict:
+    """ShanghaiTech has 13 scenes; the clip key encodes the scene as its prefix
+    (e.g. '01_0014' -> scene '01'). Reports per-scene AUROC plus the macro mean
+    (unweighted over scenes) and micro (pooled) AUROC. SeeKer reports micro
+    only, so the macro/per-scene breakdown is a genuine addition.
+
+    `clip_keys` and `frame_counts` are aligned lists giving, in the SAME order
+    as `scores`/`gt` were concatenated, each clip's key and its frame count."""
+    scores = np.asarray(scores, dtype=np.float64)
+    gt = np.asarray(gt, dtype=np.int32)
+    offsets = np.concatenate([[0], np.cumsum(frame_counts)])
+    by_scene_s: dict[str, list] = {}
+    by_scene_y: dict[str, list] = {}
+    for i, key in enumerate(clip_keys):
+        scene = str(key).split("_")[0]
+        a, b = int(offsets[i]), int(offsets[i + 1])
+        by_scene_s.setdefault(scene, []).append(scores[a:b])
+        by_scene_y.setdefault(scene, []).append(gt[a:b])
+    per = {}
+    for scene in sorted(by_scene_s):
+        s = np.concatenate(by_scene_s[scene])
+        y = np.concatenate(by_scene_y[scene])
+        per[scene] = (float(roc_auc_score(y, s)) if y.min() != y.max()
+                      else float("nan"))
+    vals = [v for v in per.values() if not np.isnan(v)]
+    return dict(per_scene=per,
+                macro=float(np.mean(vals)) if vals else float("nan"),
+                micro=float(roc_auc_score(gt, scores)) if gt.min() != gt.max() else float("nan"))

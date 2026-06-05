@@ -98,6 +98,37 @@ def test_scene_builder_layout():
     print("scene builder layout OK")
 
 
+def test_scene_builder_ped_first_ordering():
+    """The ped_first ablation must place the pedestrian block FIRST (indices
+    0:18) and the vehicles AFTER (18:18+M*Kv) -- the mirror of the default,
+    with identical content, only reordered."""
+    W = ContextSpec().img_wh[0]
+    H = ContextSpec().img_wh[1]
+    T, M, Kv = 4, 2, 6
+    Np = PED_KP + M * Kv
+    ped_xy = np.full((T, PED_KP, 2), [[400.0, 240.0]], dtype=np.float32)
+    ped_cf = np.ones((T, PED_KP), dtype=np.float32)
+    kp = oriented_box_keypoints(0.5, 0.5, 0.2, 0.1, 0.0).reshape(-1)
+    row = np.concatenate([[2, 0.8], kp]).astype(np.float32)
+    dets = [row[None] for _ in range(T)]
+    fidx = np.arange(T)
+
+    default = ContextSpec(mode="vehicle", max_vehicles=M, kv=Kv)               # veh first
+    pedfirst = ContextSpec(mode="vehicle", max_vehicles=M, kv=Kv, ped_first=True)
+    dxy, dcf = build_scene_skeleton(ped_xy, ped_cf, dets, fidx, default)
+    pxy, pcf = build_scene_skeleton(ped_xy, ped_cf, dets, fidx, pedfirst)
+    assert pxy.shape == (T, Np, 2)
+    # ped block now FIRST 18
+    assert np.allclose(pxy[:, :PED_KP], ped_xy)
+    assert pcf[0, 0] == np.float32(1.0)          # a pedestrian conf, not a vehicle
+    # first vehicle now begins at index PED_KP, conf 0.8
+    assert pcf[0, PED_KP] == np.float32(0.8)
+    # same content, mirrored: default ped (last 18) == pedfirst ped (first 18)
+    assert np.allclose(dxy[:, M * Kv:], pxy[:, :PED_KP])
+    assert np.allclose(dxy[:, :M * Kv], pxy[:, PED_KP:])
+    print("scene builder ped_first ordering OK")
+
+
 def test_scene_builder_missing_cache():
     spec = ContextSpec(mode="vehicle", max_vehicles=2, kv=6)
     T = 3
@@ -112,5 +143,6 @@ if __name__ == "__main__":
     test_scene_made_ar_no_future_leakage()
     test_pedestrian_can_see_vehicles()
     test_scene_builder_layout()
+    test_scene_builder_ped_first_ordering()
     test_scene_builder_missing_cache()
     print("\nAll scene-model tests passed.")

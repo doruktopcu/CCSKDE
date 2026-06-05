@@ -87,13 +87,15 @@ def score_test(model, loader, device, is_ctx, zero_ctx=False):
     return probs.cpu().numpy().squeeze().copy(order="C")
 
 
-def score_test_scene(model, loader, device, readout="ped"):
+def score_test_scene(model, loader, device, readout="ped", ped_first=False):
     """Scene model scoring. `readout`:
       'ped'   — pedestrian keypoints only (SeeKer-comparable; misses anomalies
                 that live in the VEHICLE, e.g. a car in a pedestrian zone).
       'joint' — pedestrian + vehicle keypoint NLL (the vehicle term is folded
                 into the 18 pedestrian slots so SeeKer's scorer still applies),
-                so vehicle-intrinsic hazards are captured."""
+                so vehicle-intrinsic hazards are captured.
+    `ped_first` matches the trained ordering: default (False) is vehicles-first
+    (pedestrian = last 18); True is the pedestrian-first ablation (first 18)."""
     model.eval().to(device)
     probs = torch.empty(0).to(device)
     for data_arr in loader:
@@ -101,17 +103,19 @@ def score_test_scene(model, loader, device, readout="ped"):
         x = xc[..., :2].to(device).float()                 # (B,T,N',2)
         conf = xc[..., -1].to(device)                      # (B,T,N')
         B, T, Np, _ = x.shape
+        psl = slice(0, PED_KP) if ped_first else slice(Np - PED_KP, Np)
+        vsl = slice(PED_KP, Np) if ped_first else slice(0, Np - PED_KP)
         with torch.no_grad():
             lnp = joint_lnp(model, x)                       # (B, N')  log-prob
-            lnp_ped = lnp[:, -PED_KP:].clone()
+            lnp_ped = lnp[:, psl].clone()
             if readout == "joint" and Np > PED_KP:
                 # fold the vehicle log-prob into the pedestrian slots so the
                 # per-frame NLL = -(sum ped + sum vehicle) = joint scene NLL.
-                lnp_veh = lnp[:, :Np - PED_KP]
+                lnp_veh = lnp[:, vsl]
                 lnp_ped = lnp_ped + lnp_veh.sum(dim=1, keepdim=True) / PED_KP
             pad = torch.randn(B, (T - 1) * PED_KP, device=device)
             nll = -torch.cat((pad, lnp_ped), dim=1)
-            nll = (nll.view(B, T, PED_KP) * conf[..., -PED_KP:]).flatten(start_dim=1)
+            nll = (nll.view(B, T, PED_KP) * conf[..., psl]).flatten(start_dim=1)
         probs = torch.cat((probs, nll), dim=0)
     return probs.cpu().numpy().squeeze().copy(order="C")
 
@@ -147,6 +151,10 @@ def main():
     ap.add_argument("--scene_readout", choices=["ped", "joint"], default="joint",
                     help="scene model: joint scene NLL (default; captures "
                          "vehicle-intrinsic hazards) or pedestrian keypoints only")
+    ap.add_argument("--ped_first", action="store_true",
+                    help="scene model trained with pedestrian-first ordering "
+                         "(ablation that removes pedestrian-given-vehicles "
+                         "conditioning); matches the trained block layout")
     ap.add_argument("--counterfactual", action="store_true",
                     help="context models: compare score with real vs zeroed "
                          "context (vehicle removed); the difference isolates the "
@@ -177,7 +185,7 @@ def main():
     n_kp = 2 * 18 * a.seg_len
     hidden = [n_kp - 2]
     spec = ContextSpec(mode="vehicle" if (a.context_mode in ("vehicle", "scene")) else "proximity",
-                       max_vehicles=a.max_vehicles, kv=a.kv)
+                       max_vehicles=a.max_vehicles, kv=a.kv, ped_first=a.ped_first)
 
     if is_scene:
         n_prime = PED_KP + a.max_vehicles * a.kv
@@ -206,9 +214,12 @@ def main():
     gt_dir = os.path.join(a.data_dir, "ShanghaiTech", "gt", "test_frame_mask")
     pcache = os.path.join(a.proximity_cache, "test")
     prox_chunks = []
+    clip_keys, frame_counts = [], []     # for the per-scene AUROC breakdown
     for clip in sorted(f for f in os.listdir(gt_dir) if f.endswith(".npy")):
         key = clip.split(".")[0]
         n_frames = int(np.load(os.path.join(gt_dir, clip)).shape[0])
+        clip_keys.append(key)
+        frame_counts.append(n_frames)
         det_path = os.path.join(pcache, f"{key}.npy")
         pj = os.path.join(args.pose_path["test"], f"{key}_alphapose_tracked_person.json")
         if not (os.path.exists(det_path) and os.path.exists(pj)):
@@ -242,7 +253,7 @@ def main():
               "interaction-specific.")
         return
 
-    scores_kp = (score_test_scene(model, loader, a.device, a.scene_readout) if is_scene
+    scores_kp = (score_test_scene(model, loader, a.device, a.scene_readout, a.ped_first) if is_scene
                  else score_test(model, loader, a.device, is_ctx))
     auc, scores, gt = score_anomalies(scores_kp, base.metadata, args=args, split="test",
                                       ret_gt=True, sigma=a.sigma)
@@ -265,6 +276,23 @@ def main():
     corr = score_proximity_correlation(scores, proximity, gt, anomalous_only=True)
     print(f"\n  score-vs-proximity (anomalous frames): "
           f"spearman={corr['spearman']:.3f} pearson={corr['pearson']:.3f} n={corr['n']}")
+
+    # --- extra frame-level report metrics (AUPRC / EER / FAR / per-scene) ---
+    from ccskde.eval.hazard import (
+        auroc_ap, equal_error_rate, false_alarm_at_recall, per_scene_auroc,
+    )
+    ap = auroc_ap(scores, gt)
+    eer = equal_error_rate(scores, gt)
+    far90 = false_alarm_at_recall(scores, gt, 0.90)
+    ps = per_scene_auroc(scores, gt, clip_keys, frame_counts)
+    print("\n=== Extra frame-level metrics ===")
+    print(f"  AUROC={ap['auroc']:.4f}  AUPRC={ap['ap']:.4f} "
+          f"(base rate {ap['base_rate']:.3f})  EER={eer['eer']:.4f}")
+    print(f"  false-alarm rate @ 90% recall: {far90['fpr']:.4f}")
+    print(f"  per-scene AUROC: micro={ps['micro']:.4f}  macro={ps['macro']:.4f}  "
+          f"(over {len(ps['per_scene'])} scenes)")
+    worst = sorted((v, k) for k, v in ps["per_scene"].items() if not math.isnan(v))[:3]
+    print("    weakest scenes: " + ", ".join(f"{k}={v:.3f}" for v, k in worst))
 
 
 if __name__ == "__main__":

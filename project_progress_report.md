@@ -491,3 +491,79 @@ universal-keypoint / animal extensions.
 **Artifacts:** `ROADMAP.md`, `scripts/measure_efficiency.py`,
 `scripts/evaluate_hazard.py` (+counterfactual, joint default), `ccskde/eval/hazard.py`
 (+balanced), `scripts/run_experiments.py` (+seeds), `report/main.tex`.
+
+### #32 — Sprint 2: metrics, paired significance, controlled ablations (v2 report)
+Three tracks, mostly on **existing saved checkpoints** (results_v2 single-seed +
+results_v3 5-seed survived on disk), so most was **eval-only** (no retraining).
+
+**Track 3 — metric suite + significance code (CPU, `ccskde/eval/hazard.py`).**
+Added & unit-tested (`tests/test_extra_metrics.py`, 8/8): DeLong correlated-AUC
+test (verified vs sklearn), AUPRC, EER, false-alarm@recall, per-scene macro/micro
+AUROC, frame- and **clip-level (block) bootstrap** of the AUROC difference. Wired
+single-model metrics into `evaluate_hazard.py`; new `scripts/compare_models.py`
+(DeLong + paired bootstrap between two checkpoints). Qualitative figure
+(`cmp_719_final_report_v2/make_qualitative.py` -> `figures/qualitative.pdf`):
+pedestrian COCO-17 skeleton + oriented vehicle keypoints on a real hazard frame
+vs a normal frame; added to the report Method section.
+
+**Phase A — eval-only on the 6 results_v2 checkpoints (`scripts/run_phase_a.py`,
+sigma=0).** Frame-level suite (per-frame scores saved to `colab_results/phase_a/`):
+baseline AUROC 0.735 / AUPRC 0.611 / EER 0.335 / macro 0.699; car-matrix 0.802 /
+0.720 / 0.270 / 0.770; FiLM best AUPRC 0.726, veh-haz 0.966, rho 0.640. **DeLong +
+clip-level bootstrap (Track 1):** every context/scene config beats baseline,
+clip-level 95% CI excludes 0 — car-matrix +0.067 [0.042,0.095], Scene-SKDE +0.047
+[0.014,0.082] (p=0.0015). Alignment verified (reconstructed baseline AUROC =
+0.7351 exactly). Honest note: DeLong's per-frame independence is optimistic ->
+clip-level bootstrap is the reported unit.
+
+**Phase B (lean) — training (`results_ablation/`, 1 GPU job, ~25 min).**
+*M-sweep* (car-matrix): M=1 0.799/0.757(macro), **M=2 0.802/0.770**, M=3
+0.788/0.747 -> M=2 optimal, M=3 adds zero-fill noise. *Agent ordering* (new
+`ped_first` flag through `ContextSpec`->`scene.py`->`SceneTrainer`->`run_experiments`,
+config `scene_pedfirst`; unit-tested, AR mask still 0 violations): vehicles-first
+vs pedestrian-first is a **near-wash** on every metric (delta<=0.3 pp) -> for the
+unified model the *joint inclusion* of vehicles, not the AR order, drives the
+effect. Method-section claim softened accordingly.
+
+**Report v2 updates** (`cmp_719_final_report_v2/`, compiles clean, **11 pp**, 0
+undefined refs/warnings): added Table tab:suite (metric suite), Table tab:delong
+(DeLong + clip-bootstrap significance), Table tab:abl (M-sweep + ordering),
+qualitative figure, **detection demo** (Fig tab:demo + GIF), setup text; removed
+the dangling "shuffled multi-seed in progress" promise.
+
+**Detection demo** (`cmp_719_final_report_v2/make_demo.py`, CPU, from saved Phase A
+scores): auto-picks the hazard clip with the largest car-matrix-over-baseline
+score gain where a vehicle is actually present in the anomaly (06_0155, a cyclist
+through a pedestrian entrance). Produces `figures/demo_detection.pdf` (score
+timeline baseline vs ours, GT shaded, vehicle-present ticks + 4 annotated
+keyframes) and `demo_detection.gif` (65-frame animation with live hazard score).
+At the vehicle-present peak (frame 180) ours=0.87 vs baseline 0.49; both ~0.1 on
+normal frames.
+
+**Real-time GUI** (`scripts/realtime_demo.py`, Tkinter + Pillow, no web/GPU):
+rolls clips at 24 fps with skeleton + oriented-vehicle overlays, a live hazard
+gauge that fires above a threshold slider, a rolling score sparkline, GT label,
+and Auto-advance through a hazard reel (~1 min). Plays the model's actual
+per-frame scores (from the Phase A inference) synced to the frames. `--selftest`
+renders one frame headless for validation. Run:
+`set PYTHONPATH=%CD% && .venv\Scripts\python scripts\realtime_demo.py`.
+
+### #33 — Report v3 branched; cross-dataset study begins (UBnormal, Street Scene)
+**Versioning:** froze **v2** as the submission-ready snapshot
+(`cmp_719_final_report_v2/`, 11 pp, clean) and copied it to **v3**
+(`cmp_719_final_report_v3/`) as the new working version. All further work goes in
+v3. State recorded in `REPORT_STATE.md`. Dataset dossier in `dataset_options.md`.
+**Plan:** add a cross-dataset section — the key weakness is ShanghaiTech can't
+separate hazard from object-presence (vehicles rare → vehicle≈anomaly). Chosen:
+**UBnormal first** (SeeKer-comparable, poses small) for an ours-vs-SeeKer
+cross-dataset comparison; **Street Scene** (MERL/Zenodo, 49 GB single zip; user
+downloading) as the mixed-traffic / vehicles-normal benchmark where the
+counterfactual can truly separate hazard from presence. Note: ours-vs-SeeKer on
+UBnormal needs RGB (to run YOLO-seg vehicles for the "ours" context), not just the
+released poses.
+**New/edited code:** `ccskde/eval/hazard.py`, `scripts/run_phase_a.py`,
+`scripts/compare_models.py`, `scripts/evaluate_hazard.py` (+ped_first, +metrics),
+`scripts/run_experiments.py` (+scene_pedfirst), `ccskde/context/{config,scene}.py`,
+`ccskde/training.py`, `tests/{test_extra_metrics,test_scene_model}.py`.
+**Still deferred:** 5-seed error bars on proximity/film/scene/shuffled (Track 1
+"full"); MSAD-HR second dataset; baseline-0.855 repro (W4); flow/diffusion head.

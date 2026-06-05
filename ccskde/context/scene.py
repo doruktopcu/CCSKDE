@@ -47,10 +47,14 @@ def build_scene_skeleton(
     aug_xy = np.zeros((T, n_prime, 2), dtype=np.float32)
     aug_cf = np.zeros((T, n_prime), dtype=np.float32)
 
-    # pedestrian block goes last
-    ped0 = M * Kv
-    aug_xy[:, ped0:] = ped_xy_px
-    aug_cf[:, ped0:] = ped_conf
+    # Block placement. Default: vehicles first, pedestrian last (so the
+    # pedestrian is autoregressively conditioned on the vehicles). The
+    # `ped_first` ablation flips this — pedestrian first, vehicles after —
+    # removing that conditioning at identical model capacity.
+    ped0 = 0 if spec.ped_first else M * Kv
+    veh0 = PED_KP if spec.ped_first else 0
+    aug_xy[:, ped0:ped0 + PED_KP] = ped_xy_px
+    aug_cf[:, ped0:ped0 + PED_KP] = ped_conf
 
     if dets_per_frame is None:
         return aug_xy, aug_cf
@@ -81,7 +85,7 @@ def build_scene_skeleton(
             kp_px = kp_norm.copy()
             kp_px[:, 0] *= float(W)
             kp_px[:, 1] *= float(H)
-            base = slot * Kv
+            base = veh0 + slot * Kv
             aug_xy[t, base:base + Kv] = kp_px
             aug_cf[t, base:base + Kv] = float(rows[idx][1])   # detection conf
     return aug_xy, aug_cf

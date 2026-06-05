@@ -75,12 +75,14 @@ class SceneTrainer(SeeKerTrainer):
             x = xc[..., :2].to(self.args.device).float()      # (B,T,N',2)
             conf = xc[..., -1].to(self.args.device)           # (B,T,N')
             B, T, Np, _ = x.shape
+            ped_first = getattr(self, "ped_first", False)
+            psl = slice(0, self.PED_KP) if ped_first else slice(Np - self.PED_KP, Np)
             with torch.no_grad():
                 lnp = self.joint_lnp(x)                        # (B, N')
-                lnp_ped = lnp[:, -self.PED_KP:]                # pedestrian keypoints
+                lnp_ped = lnp[:, psl]                          # pedestrian keypoints
                 pad = torch.randn(B, (T - 1) * self.PED_KP, device=self.args.device)
                 nll = -torch.cat((pad, lnp_ped), dim=1)
-                conf_ped = conf[..., -self.PED_KP:]            # (B,T,18)
+                conf_ped = conf[..., psl]                      # (B,T,18)
                 nll = (nll.view(B, T, self.PED_KP) * conf_ped).flatten(start_dim=1)
             probs = torch.cat((probs, nll), dim=0)
         scores = probs.cpu().detach().numpy().squeeze().copy(order="C")

@@ -38,10 +38,16 @@ zero-new-data wins we can land immediately.
 - [ ] **W4 — reproduce baseline ≈ 0.855** on ShanghaiTech (debug lr / epochs /
       seg-len / stride / normalization / conf-threshold). Until this lands, all
       relative gains are suspect.
-- [ ] **W3 — full multi-seed matrix (≥5 seeds)** + significance tests (paired
-      bootstrap / Wilcoxon) for every config comparison.
-- [ ] **W9 — ablation sweeps:** M (#vehicles), K_v, agent ordering
-      (vehicles-first vs after), FiLM on/off *on the hazard metric*, ± velocity.
+- [~] **W3 — significance tests DONE; full 5-seed matrix partial.** DeLong
+      correlated-AUC + clip-level (block) bootstrap added (`ccskde/eval/hazard.py`,
+      `scripts/compare_models.py`); baseline-vs-each-config significant, clip-level
+      95% CI excludes 0 (car-matrix +0.067 [0.042,0.095]). 5-seed error bars exist
+      for baseline+vehicle; proximity/film/scene/shuffled 5-seed still TODO.
+- [~] **W9 — ablation sweeps: M + ordering + FiLM + representation DONE.**
+      M∈{1,2,3} (M=2 optimal), agent ordering (vehicles-first vs pedestrian-first
+      = near-wash → joint inclusion drives it, not order; new `ped_first` flag +
+      `scene_pedfirst` config), FiLM on/off and box-vs-oriented on the metric
+      suite. In report Table `tab:abl`/`tab:suite`. Still TODO: K_v, ±velocity.
 - [ ] **W10 — perception-robustness study:** inject detection noise / dropout /
       false-positive vehicles; measure score stability.
 - [ ] **#4 — expressive conditional:** replace per-keypoint diagonal Gaussian with

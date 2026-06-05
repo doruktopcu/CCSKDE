@@ -37,6 +37,11 @@ class ContextSpec:
     mode: str = "proximity"
     max_vehicles: int = 2   # M nearest hazards kept in "vehicle" mode
     kv: int = 6             # keypoints per vehicle (4 corners + center + heading)
+    # Scene-SKDE agent ordering. Default (False) puts vehicles FIRST so the
+    # pedestrian is predicted *given* the vehicles (interaction conditioning).
+    # Setting True puts the pedestrian first (vehicles after) — the ablation
+    # that REMOVES the conditioning while keeping identical model capacity.
+    ped_first: bool = False
 
     @property
     def proximity_dim(self) -> int:
