@@ -290,3 +290,280 @@ data/ShanghaiTech/
 - `report/main.tex` — updated Section 4 with results table, figure, discussion, and future work.
 - `report/main.pdf` — compiled, 7 pages, zero LaTeX errors.
 **Next:** submit report to nazli@cs.hacettepe.edu.tr by 2026-05-04 23:59; prepare for final-report phase (extended context vocabulary, multiplicative injection, UBnormal evaluation).
+
+### #20 — Resumed on Windows / RTX 5080; environment rebuilt
+**Date:** 2026-05-29
+**Type:** setup
+**Summary:** Project transferred from Mac to a Windows 11 PC with an **RTX 5080 (Blackwell, sm_120)**. Purged macOS AppleDouble (`._*`) + `.DS_Store` litter (some had landed inside `.git/objects/pack/`, causing `non-monotonic index` errors on every git call). Installed Python 3.12.10, created `.venv`, installed **PyTorch 2.11.0+cu128** (Blackwell needs CUDA 12.8 wheels — cu121 will not run) + the rest of `requirements.txt` (numpy pinned 1.26.4). Verified CUDA + GPU matmul. All training now runs locally (previously Colab A100).
+**Artifacts:** `.venv/` (gitignored). `~/.claude/.../memory/ccskde-env.md`.
+
+### #21 — CRITICAL bug: C_t was computed in the wrong coordinate frame
+**Date:** 2026-05-29
+**Type:** bugfix
+**Summary:** End-to-end audit found the load-bearing defect behind the milestone's null result. `ccskde/data/contextual_dataset.py` computed the pedestrian centroid from `base[index]` — i.e. the pose AFTER SeeKer's `normalize_pose` (per-segment zero-mean / unit-std, data_utils.py:59). YOLO boxes are in `[0,1]` image coordinates, so the two lived in incompatible frames. The normalized centroid collapses to ~origin, so `C_t` degenerated into roughly "inverse distance from the image's top-left corner to the nearest vehicle" — **almost pedestrian-independent**. This explains the milestone's peak tie and the small shuffled-context gap.
+**Fix:** compute the centroid from the RAW pixel keypoints (`base.segs_data_np[index]`) divided by `(W,H) = (856,480)` (verified uniform across all 13 scenes). Added `img_wh` to `ContextSpec`.
+**Verification:** `tests/test_context_coords.py` — a pedestrian placed on a detected bicycle now yields `1/d_min` ≈ 1000 vs ≈ 1.5 at the opposite corner (was identical before). Preliminary 1-epoch run (stride 12): baseline 0.742 → corrected-proximity **0.790** (+4.8 pp), where the milestone had a tie.
+**Artifacts:** `ccskde/context/config.py`, `ccskde/data/contextual_dataset.py`, `tests/test_context_coords.py`.
+
+### #22 — "Car-skeleton" oriented vehicle-keypoint context (the uplift)
+**Date:** 2026-05-29
+**Type:** code + research
+**Summary:** Replaced the coarse per-class `[1/d_min,count]` proximity with a structured **oriented vehicle-keypoint matrix** ("like a box, but better", per the user's idea). Each of the M nearest hazards is represented by K_v=6 keypoints — 4 oriented corners + center + heading — derived from a **YOLOv11-seg** mask via `cv2.minAreaRect`/`boxPoints` (orientation that an axis-aligned box lacks), expressed in **pedestrian-relative, scale-normalised** coords (translation+scale invariant; addresses the report's scene-generalisation challenge). Literature check: dedicated vehicle-keypoint nets (SKoPe3D, 33 kpts) are synthetic/frontal and don't transfer to surveillance views, so a seg-derived oriented skeleton is the right lightweight choice (cf. bounding-ellipse work for overhead vehicles).
+**Decision:** corners are computed in PIXEL space then normalised (rotating an oriented box in anisotropic [0,1] space distorts angles). Cache schema v2 = 14 cols `(cls,conf,4 corners,center,heading)`; the old 6-col box cache is auto-handled as an axis-aligned "box pseudo-skeleton" fallback/ablation.
+**Artifacts:** `ccskde/context/vehicle.py`, `ccskde/context/detect.py` (`extract_clip_oriented`, `load_yolo_seg`), `ccskde/context/config.py` (`mode`/`max_vehicles`/`kv`/`vehicle_dim`), `scripts/extract_yolo_detections.py` (`--oriented`), `tests/test_vehicle_context.py` (geometry + scale-invariance + top-M + fallback, all pass).
+
+### #23 — FiLM covariance modulation (contextual covariance penalty)
+**Date:** 2026-05-29
+**Type:** code + research
+**Summary:** Implemented the proposal's promised "contextual covariance penalty" as a **FiLM** head (Perez et al., 2018): a small MLP maps the context to per-coordinate `(gamma,beta)` that modulate the predicted covariance, `logvar <- (1+gamma(C))*logvar + beta(C)`. Zero-initialised so it is exactly identity at start (training begins at the shortcut-only model). FiLM depends only on C, so MADE's autoregressive causality is untouched.
+**Resolves report-vs-code discrepancy:** the report claimed a full 2×2 Cholesky covariance, but the code (and SeeKer's *headline* config, per arXiv:2506.18368) is **diagonal**; full Cholesky is only a SeeKer ablation. The report will be corrected to "diagonal + FiLM covariance modulation".
+**Verification:** `tests/test_ar_mask.py` — empirical Jacobian shows **0 forbidden-region violations**, 100% past-frame reachability, all context inputs reachable, and FiLM zero-init parity with the shortcut-only model.
+**Artifacts:** `ccskde/models/made_partial_context.py` (`film_cov`), `ccskde/seeker_ctx.py` (`--context_mode`, `--film_cov`, `--max_vehicles`, `--kv`), `tests/test_ar_mask.py`.
+
+### #24 — Honest hazard-subset evaluation (the question never tested)
+**Date:** 2026-05-29
+**Type:** code
+**Summary:** Built the evaluation the milestone lacked: isolate pedestrian-vehicle hazard events instead of mixing them with motion-intrinsic anomalies. `ccskde/eval/hazard.py` computes per-frame proximity and reports AUROC on the full set, the **interaction regime** (vehicle near a pedestrian) and the **vehicle-hazard** set (normal + near-vehicle anomalies), plus the **Spearman score-vs-proximity** correlation over anomalous frames. `scripts/evaluate_hazard.py` drives it from a checkpoint.
+**Verification:** driver reproduces the baseline full-set AUROC **exactly (0.7808)**, confirming the scoring path matches seeker's; frame alignment asserted. Baseline reference on the old checkpoint: vehicle-hazard AUROC ≈ 0.84–0.88, score-proximity Spearman ≈ 0.31. `tests/test_hazard_eval.py` passes.
+**Artifacts:** `ccskde/eval/`, `scripts/evaluate_hazard.py`, `tests/test_hazard_eval.py`.
+
+### #25 — Unified experiment runner + per-epoch validation fix
+**Date:** 2026-05-29
+**Type:** code + bugfix
+**Summary:** `scripts/run_experiments.py` loads the pose data ONCE and runs the full config matrix {baseline, proximity, proximity_shuffled, vehicle, vehicle_film, vehicle_shuffled}, recording per-epoch val AUROC → `experiment_results.json` + `auroc_curves.png` (incremental save + resume). Added `ContextualSkeletonSequenceDataset.precompute()` to materialise the context once (the per-item Python build otherwise dominates at stride 1). Fixed the load-bearing `"ShangaiTech"` misspelling in the validation guard (`ccskde/training.py`) — it only ever validated by accident; made per-epoch validation explicit. Noted (not fixed, vendored) that `seeker/training.py:test()` references an undefined `joint_lnp_full_window` and mis-unpacks `score_anomalies`; our eval path avoids it.
+**Artifacts:** `scripts/run_experiments.py`, `ccskde/data/contextual_dataset.py` (`precompute`), `ccskde/training.py`.
+
+### #26 — Tests + skills
+**Date:** 2026-05-29
+**Type:** code + doc
+**Summary:** Added a `tests/` suite (`test_context_coords`, `test_vehicle_context`, `test_ar_mask`, `test_hazard_eval`) — the project had none. Added two project skills: `.claude/skills/ccskde-run` (extraction + experiment matrix + single runs) and `.claude/skills/ccskde-eval` (results, hazard analysis, test suite, "what working looks like").
+**Artifacts:** `tests/*`, `.claude/skills/ccskde-run/SKILL.md`, `.claude/skills/ccskde-eval/SKILL.md`.
+
+### #27 — Unified scene-SKDE: cars as skeletal agents (new headline model)
+**Date:** 2026-05-29
+**Type:** code + research
+**Summary:** Per the user's direction ("merge the SKDE concept to cars... single
+formula"), generalised the model from "pedestrian density + car context" to a
+**unified scene density**. Each frame becomes one augmented skeleton
+`Z = [V^1..V^M (6 kp each), P (18 kp)]`, `N'=18+6M`, vehicles ordered first so
+the pedestrian keypoints are predicted *given* the vehicles. SeeKer's
+autoregressive factorisation is applied verbatim to `Z`; the single hazard score
+is `S(t) = -Σ_n c_{t,n} ln p_θ(Z_{t,n}|Z_{t,<n},Z_Δ)`. Cars are now modelled
+(have their own NLL terms), not used as side info. Trained on the joint NLL;
+frame scoring reads out the pedestrian keypoints (last 18) for SeeKer
+comparability while still reflecting vehicle conditioning.
+**Grounding:** SeeKer (arXiv:2506.18368) models only one human skeleton and
+max-pools people — never objects/interactions, so this is a genuine gap.
+Precedent for joint multi-agent density VAD: Wiederer et al. 2022
+(multi-agent trajectory density), ComplexVAD 2025 (interaction anomalies).
+**Verification:** `tests/test_scene_model.py` — generalised MADE (N'=30) has
+**0 AR-forbidden-region violations**; the pedestrian→vehicle attention pathway
+is confirmed present; scene-builder layout + missing-cache handled.
+**Artifacts:** `ccskde/models/scene_made.py` (`SceneMADEPartial`,
+`PartialAutoregressiveSceneFC`), `ccskde/context/scene.py`,
+`ccskde/data/scene_dataset.py`, `ccskde/training.py` (`SceneTrainer`),
+`scripts/run_experiments.py` (`scene` config), `tests/test_scene_model.py`,
+`CLAUDE.md`, `check-here-doruk.md`.
+**Next:** run the `scene` config + hazard-subset eval once the in-flight matrix
+(baseline/proximity/vehicle/vehicle_film/vehicle_shuffled) completes; fill the
+report results (car-matrix/scene-led) and recompile.
+
+### #28 — Full results (local RTX 5080) + hazard-subset analysis
+**Date:** 2026-05-29
+**Type:** experiment
+**Summary:** Ran the full matrix (10 epochs, batch 1024, seg_len 24, stride 1,
+seed 42) via `scripts/run_experiments.py` and the hazard-subset eval.
+
+ShanghaiTech validation AUROC:
+
+| Model | Best | Mean |
+|---|---|---|
+| SeeKer baseline | 0.7351 | 0.7204 |
+| CCSKDE proximity (coord-fixed) | 0.8034 | 0.7857 |
+| CCSKDE vehicle (car-matrix) | 0.8023 | 0.7855 |
+| CCSKDE vehicle + FiLM | 0.7971 | **0.7898** |
+| CCSKDE vehicle (shuffled ctx) | 0.7893 | 0.7835 |
+| **Unified scene-SKDE** | 0.7980 | 0.7863 |
+
+Context/scene = **+6–7 pp mean over baseline** (milestone was a tie → the
+coordinate bug was the cause). Our baseline *mean* (0.720) matches the
+milestone's baseline mean (0.731); the milestone's 0.781 was one lucky epoch.
+Shuffled control is ~1 pp below aligned vehicle ⇒ ~1 pp is genuine spatial
+signal, the rest is structured-input capacity. (Single seed; multi-seed would
+tighten the comparison — noted as future work.)
+
+**Hazard-subset eval** (`scripts/evaluate_hazard.py`):
+
+| Model | full | vehicle-hazard AUROC | score↔proximity ρ |
+|---|---|---|---|
+| baseline | 0.735 | ~0.79 | 0.16 |
+| vehicle+FiLM | 0.797 | **0.965** | **0.64** |
+| scene (joint readout) | 0.782 | 0.95 | 0.60 |
+
+The car models flag pedestrian-vehicle proximity as anomalous (the traffic-hazard
+goal): score↔proximity correlation jumps 0.16→0.64, and near-vehicle anomalies
+are detected at ~0.95–0.965 vs baseline ~0.79.
+
+**Honest caveats logged:** (i) the "interaction-regime AUROC" metric is
+unreliable here because near-vehicle frames on ShanghaiTech are ~91% anomalous
+(5035 anomalous vs 487 normal) — a near-degenerate subset; we report
+vehicle-hazard AUROC + proximity correlation instead. (ii) The scene model's
+pedestrian-only readout misses vehicle-intrinsic anomalies; a joint readout
+(fold vehicle NLL into the score) raises proximity ρ to 0.60. (iii) The scene
+2-min-vs-vehicle-13.7-min wall-clock gap was pure system load (973 train
+batches/epoch in both; scene ran on an idle machine at ~107 it/s vs ~7 it/s),
+not a data/training difference — verified from the logs.
+**Artifacts:** `colab_results/results_v2/experiment_results.json`,
+`auroc_curves.png`, per-config `ShanghaiTech_*/<ts>/checkpoint_best.pth`.
+
+### #29 — Session wrap + resume docs
+**Date:** 2026-05-29
+**Type:** doc
+**Summary:** Wrote `README.md` (canonical overview + achievements + results +
+quick-start). Refreshed `HANDOFF.md` to the final state with exact
+continue-from-here commands and the open next-steps list. Updated `CLAUDE.md`
+(status pointer) and the cross-session memory (`ccskde-env.md`) with the project
+state. Recompiled `report/main.pdf` cleanly (8 pp, 0 errors) with the new
+results tables + curves. All seven session tasks complete.
+**State for the next session:** start from `README.md` / `HANDOFF.md`. Everything
+implemented, tested, run, written up; **uncommitted on `main`**. Open (non-blocking)
+follow-ups in `check-here-doruk.md`: commit-to-branch, YOLO-World road elements,
+yolo11l-seg re-extraction, multi-seed runs, joint-readout scene scoring default,
+full 2×2 context-rotated covariance.
+**Artifacts:** `README.md`, `HANDOFF.md`, `CLAUDE.md`, `report/main.pdf`,
+memory `ccskde-env.md`.
+
+### #30 — Vendored the SeeKer baseline (de-submodule)
+**Date:** 2026-05-29
+**Type:** decision + code
+**Summary:** `seeker/` was an improperly-configured git **gitlink** — no
+`.gitmodules`, pointing at the unpushable local commit `3706984` — so a fresh
+`git clone` produced an *empty* `seeker/` and the tree always showed dirty
+("modified content, untracked content"). Reproduction across machines was only
+possible by manual SSD copy. Decision (user-approved): **vendor** SeeKer as plain
+tracked files in the CCSKDE repo for one-repo, clone-and-run reproducibility.
+This supersedes the original "vendored submodule" convention in #2/#3 (the
+read-only-baseline rule still stands; it is just no longer a nested repo).
+**How:** captured provenance first — `seeker/PORTABILITY_PATCHES.patch`
+(full diff vs upstream base `7e7ab66`, 5 files) and `seeker/VENDORED.md`
+(upstream URL, MIT license retained, base commit, rationale). Then
+`git rm --cached seeker`; `rm -rf seeker/.git`; `git add seeker`. The existing
+`.gitignore` (`exp_dir/`, `runs/`, `__pycache__/`, `*.pth`) already excludes the
+69 MB of training artifacts, so only 17 source files (~63 KB) were committed.
+**Verification:** `git status` now clean of `seeker`; vendored seeker imports OK
+and the ccskde→seeker bridge (`scene_dataset` → `normalize_pose`) works.
+**Reversible:** the gitlink history remains on `origin/final-ccskde` pre-merge,
+and the patch + VENDORED.md let the submodule be re-derived if ever wanted.
+**Artifacts:** commit `026166e`, `seeker/VENDORED.md`,
+`seeker/PORTABILITY_PATCHES.patch`.
+
+### #31 — Adversarial review + Sprint 1 (review-driven fixes)
+**Date:** 2026-06-04
+**Type:** research + code + doc
+**Summary:** Wrote a harsh from-scratch reviewer assessment (weaknesses W1–W12;
+verdict Reject→Major-Revision) and a 10-direction ideation, then created
+`ROADMAP.md` (Sprint 1 / Ambitious / Ultra) and executed **Sprint 1** (8 items).
+(Note: a file the user supplied as the SeeKer source was actually a different
+paper, "POINTS-Seeker"; review was grounded in the real SeeKer — arXiv 2506.18368
++ vendored code. Verified SeeKer facts: datasets UBnormal/ShanghaiTech(+HR)/MSAD-HR
+— *not* Avenue; ShanghaiTech 85.5; full-cov $\approx$ diagonal 77.8 vs 77.9.)
+**Sprint 1 delivered:**
+- **Counterfactual interaction probe** (`evaluate_hazard.py --counterfactual`,
+  W1/W2): zeroing context → near-baseline (0.741 / veh-hazard 0.79 / ρ 0.15); the
+  isolated interaction term (real−cf) → veh-hazard AUROC **0.967**, ρ **0.70**,
+  but full-AUROC only 0.69 — i.e. the gain is **interaction-specific, not generic
+  capacity or a constant presence offset**. Strong rebuttal to W1.
+- **Balanced near-vehicle AUROC** (bootstrap, W8): **0.62 [0.59, 0.66]** — above
+  chance after removing the ~91% positive imbalance (`balanced_hazard_auroc`).
+- **Efficiency** (`scripts/measure_efficiency.py`, W11): 2.24/2.97/6.22 M params,
+  0.30/0.41/0.72 ms/batch, >3e7 frame-scores/s on RTX 5080.
+- **Multi-seed harness** (`run_experiments.py --seeds`, W3 capability):
+  per-config mean±std aggregation.
+- **Joint readout default** for the scene model (W6); **terminology** corrected
+  ("oriented bounding box rendered as keypoints", not a skeleton, W7); report
+  gains **related-work positioning** (ComplexVAD'25, Wiederer'22) + a
+  **scope/theory** paragraph (W12) + the counterfactual/efficiency results; and
+  **SeeKer facts** fixed (datasets, full-cov≈diagonal → drop full-cov roadmap).
+**Deferred (Ambitious/Ultra in ROADMAP.md):** reproduce baseline ≈0.855 (W4),
+full multi-seed + significance (W3), ablations (W9), perception robustness (W10),
+flow/diffusion conditional, joint crowd-SKDE, second dataset MSAD-HR (W5),
+universal-keypoint / animal extensions.
+**Artifacts:** `ROADMAP.md`, `scripts/measure_efficiency.py`,
+`scripts/evaluate_hazard.py` (+counterfactual, joint default), `ccskde/eval/hazard.py`
+(+balanced), `scripts/run_experiments.py` (+seeds), `report/main.tex`.
+
+### #32 — Sprint 2: metrics, paired significance, controlled ablations (v2 report)
+Three tracks, mostly on **existing saved checkpoints** (results_v2 single-seed +
+results_v3 5-seed survived on disk), so most was **eval-only** (no retraining).
+
+**Track 3 — metric suite + significance code (CPU, `ccskde/eval/hazard.py`).**
+Added & unit-tested (`tests/test_extra_metrics.py`, 8/8): DeLong correlated-AUC
+test (verified vs sklearn), AUPRC, EER, false-alarm@recall, per-scene macro/micro
+AUROC, frame- and **clip-level (block) bootstrap** of the AUROC difference. Wired
+single-model metrics into `evaluate_hazard.py`; new `scripts/compare_models.py`
+(DeLong + paired bootstrap between two checkpoints). Qualitative figure
+(`cmp_719_final_report_v2/make_qualitative.py` -> `figures/qualitative.pdf`):
+pedestrian COCO-17 skeleton + oriented vehicle keypoints on a real hazard frame
+vs a normal frame; added to the report Method section.
+
+**Phase A — eval-only on the 6 results_v2 checkpoints (`scripts/run_phase_a.py`,
+sigma=0).** Frame-level suite (per-frame scores saved to `colab_results/phase_a/`):
+baseline AUROC 0.735 / AUPRC 0.611 / EER 0.335 / macro 0.699; car-matrix 0.802 /
+0.720 / 0.270 / 0.770; FiLM best AUPRC 0.726, veh-haz 0.966, rho 0.640. **DeLong +
+clip-level bootstrap (Track 1):** every context/scene config beats baseline,
+clip-level 95% CI excludes 0 — car-matrix +0.067 [0.042,0.095], Scene-SKDE +0.047
+[0.014,0.082] (p=0.0015). Alignment verified (reconstructed baseline AUROC =
+0.7351 exactly). Honest note: DeLong's per-frame independence is optimistic ->
+clip-level bootstrap is the reported unit.
+
+**Phase B (lean) — training (`results_ablation/`, 1 GPU job, ~25 min).**
+*M-sweep* (car-matrix): M=1 0.799/0.757(macro), **M=2 0.802/0.770**, M=3
+0.788/0.747 -> M=2 optimal, M=3 adds zero-fill noise. *Agent ordering* (new
+`ped_first` flag through `ContextSpec`->`scene.py`->`SceneTrainer`->`run_experiments`,
+config `scene_pedfirst`; unit-tested, AR mask still 0 violations): vehicles-first
+vs pedestrian-first is a **near-wash** on every metric (delta<=0.3 pp) -> for the
+unified model the *joint inclusion* of vehicles, not the AR order, drives the
+effect. Method-section claim softened accordingly.
+
+**Report v2 updates** (`cmp_719_final_report_v2/`, compiles clean, **11 pp**, 0
+undefined refs/warnings): added Table tab:suite (metric suite), Table tab:delong
+(DeLong + clip-bootstrap significance), Table tab:abl (M-sweep + ordering),
+qualitative figure, **detection demo** (Fig tab:demo + GIF), setup text; removed
+the dangling "shuffled multi-seed in progress" promise.
+
+**Detection demo** (`cmp_719_final_report_v2/make_demo.py`, CPU, from saved Phase A
+scores): auto-picks the hazard clip with the largest car-matrix-over-baseline
+score gain where a vehicle is actually present in the anomaly (06_0155, a cyclist
+through a pedestrian entrance). Produces `figures/demo_detection.pdf` (score
+timeline baseline vs ours, GT shaded, vehicle-present ticks + 4 annotated
+keyframes) and `demo_detection.gif` (65-frame animation with live hazard score).
+At the vehicle-present peak (frame 180) ours=0.87 vs baseline 0.49; both ~0.1 on
+normal frames.
+
+**Real-time GUI** (`scripts/realtime_demo.py`, Tkinter + Pillow, no web/GPU):
+rolls clips at 24 fps with skeleton + oriented-vehicle overlays, a live hazard
+gauge that fires above a threshold slider, a rolling score sparkline, GT label,
+and Auto-advance through a hazard reel (~1 min). Plays the model's actual
+per-frame scores (from the Phase A inference) synced to the frames. `--selftest`
+renders one frame headless for validation. Run:
+`set PYTHONPATH=%CD% && .venv\Scripts\python scripts\realtime_demo.py`.
+
+### #33 — Report v3 branched; cross-dataset study begins (UBnormal, Street Scene)
+**Versioning:** froze **v2** as the submission-ready snapshot
+(`cmp_719_final_report_v2/`, 11 pp, clean) and copied it to **v3**
+(`cmp_719_final_report_v3/`) as the new working version. All further work goes in
+v3. State recorded in `REPORT_STATE.md`. Dataset dossier in `dataset_options.md`.
+**Plan:** add a cross-dataset section — the key weakness is ShanghaiTech can't
+separate hazard from object-presence (vehicles rare → vehicle≈anomaly). Chosen:
+**UBnormal first** (SeeKer-comparable, poses small) for an ours-vs-SeeKer
+cross-dataset comparison; **Street Scene** (MERL/Zenodo, 49 GB single zip; user
+downloading) as the mixed-traffic / vehicles-normal benchmark where the
+counterfactual can truly separate hazard from presence. Note: ours-vs-SeeKer on
+UBnormal needs RGB (to run YOLO-seg vehicles for the "ours" context), not just the
+released poses.
+**New/edited code:** `ccskde/eval/hazard.py`, `scripts/run_phase_a.py`,
+`scripts/compare_models.py`, `scripts/evaluate_hazard.py` (+ped_first, +metrics),
+`scripts/run_experiments.py` (+scene_pedfirst), `ccskde/context/{config,scene}.py`,
+`ccskde/training.py`, `tests/{test_extra_metrics,test_scene_model}.py`.
+**Still deferred:** 5-seed error bars on proximity/film/scene/shuffled (Track 1
+"full"); MSAD-HR second dataset; baseline-0.855 repro (W4); flow/diffusion head.

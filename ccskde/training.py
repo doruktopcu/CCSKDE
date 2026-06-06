@@ -26,6 +26,71 @@ from training import SeeKerTrainer            # noqa: E402  (after sys.path twea
 from validation import score_anomalies        # noqa: E402
 
 
+class SceneTrainer(SeeKerTrainer):
+    """Unified scene-SKDE trainer.
+
+    The model consumes an augmented scene skeleton (B, T, N', 2) with
+    N' = 18 + 6M keypoints (vehicles first, pedestrian last) and is trained on
+    the JOINT negative log-likelihood over all N' keypoints — cars are modelled,
+    not just used as side information. SeeKer's `joint_lnp` is keypoint-count
+    agnostic, so it is inherited unchanged. For frame-level scoring we read out
+    the PEDESTRIAN keypoints' NLL (the last 18), keeping the score directly
+    comparable to SeeKer while reflecting the vehicle conditioning.
+    """
+
+    PED_KP = 18
+
+    def train(self, clip=100):
+        import math  # noqa: F401  (parity with base)
+        self.all_val_auc: dict[int, float] = {}
+        self.model = self.model.to(self.args.device)
+        for epoch in range(self.args.epochs):
+            self.model.train()
+            print(f"[scene] epoch {epoch + 1}/{self.args.epochs}")
+            pbar = tqdm(self.train_loader)
+            loss_val = float("nan")
+            for data_arr in pbar:
+                x = torch.permute(data_arr[0], (0, 2, 3, 1))[..., :2]
+                x = x.to(self.args.device, non_blocking=True).float()
+                lnp = self.joint_lnp(x)                 # (B, N') joint
+                loss = -lnp.sum(-1).mean()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip)
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+                loss_val = loss.item()
+                pbar.set_description(f"Loss: {loss_val:.3f}")
+            self.log_writer.add_scalar("NLL Loss", loss_val, epoch)
+            auc = self.validate()
+            self.all_val_auc[epoch] = auc
+            if auc == max(self.all_val_auc.values()):
+                self.save_checkpoint(epoch=epoch, filename="checkpoint_best.pth")
+        return auc
+
+    def validate(self):
+        self.model.eval().to(self.args.device)
+        probs = torch.empty(0).to(self.args.device)
+        for data_arr in tqdm(self.val_loader):
+            xc = torch.permute(data_arr[0], (0, 2, 3, 1))
+            x = xc[..., :2].to(self.args.device).float()      # (B,T,N',2)
+            conf = xc[..., -1].to(self.args.device)           # (B,T,N')
+            B, T, Np, _ = x.shape
+            ped_first = getattr(self, "ped_first", False)
+            psl = slice(0, self.PED_KP) if ped_first else slice(Np - self.PED_KP, Np)
+            with torch.no_grad():
+                lnp = self.joint_lnp(x)                        # (B, N')
+                lnp_ped = lnp[:, psl]                          # pedestrian keypoints
+                pad = torch.randn(B, (T - 1) * self.PED_KP, device=self.args.device)
+                nll = -torch.cat((pad, lnp_ped), dim=1)
+                conf_ped = conf[..., psl]                      # (B,T,18)
+                nll = (nll.view(B, T, self.PED_KP) * conf_ped).flatten(start_dim=1)
+            probs = torch.cat((probs, nll), dim=0)
+        scores = probs.cpu().detach().numpy().squeeze().copy(order="C")
+        auc = score_anomalies(scores, self.val_metadata, args=self.args, split="validation")
+        print("AUC on val (scene, pedestrian readout):", auc)
+        return auc
+
+
 def _unpack(data_arr, device):
     """Returns (x_pose [B,T,N,2], conf [B,T,N], c [B,T,Dctx])."""
     x_full = torch.permute(data_arr[0], (0, 2, 3, 1))  # (B, T, N, 3)
@@ -87,7 +152,13 @@ class CCSKDETrainer(SeeKerTrainer):
                 pbar.set_description(f"Loss: {neg_ll.item()}")
             self.log_writer.add_scalar("NLL Loss", neg_ll.item(), epoch)
 
-            if self.dataset not in ["ShangaiTech", "MSAD"]:
+            # Per-epoch validation. For ShanghaiTech val==test, so we always
+            # score to produce the epoch-level AUROC curve. NOTE: upstream
+            # seeker/training.py guards this on `dataset not in ["ShangaiTech",
+            # "MSAD"]` — "ShangaiTech" is misspelled, so it never matched the
+            # real "ShanghaiTech" arg and validation ran *by accident*. We make
+            # that intent explicit here (validate whenever a val loader exists).
+            if self.val_loader is not None:
                 auc_val = self.validate()
                 all_val_auc[epoch] = auc_val
             else:
@@ -96,6 +167,7 @@ class CCSKDETrainer(SeeKerTrainer):
             is_best = auc_val == max(all_val_auc.values(), default=0)
             if is_best:
                 self.save_checkpoint(epoch=epoch, filename="checkpoint_best.pth")
+        self.all_val_auc = all_val_auc      # expose per-epoch history to runners
         return auc_val
 
     # ---- validation

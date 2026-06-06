@@ -58,5 +58,7 @@ report_overleaf/*.out
 # Notebooks
 .ipynb_checkpoints/
 
-# Claude / Gemini
-.claude/
+# Claude / Gemini — track project skills, keep machine-local config out
+.claude/*
+!.claude/skills/
+.claude/settings.local.json

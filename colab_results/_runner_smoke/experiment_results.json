@@ -1,0 +1,33 @@
+{
+  "results": {
+    "baseline": {
+      "aucs": [
+        0.7420545700886073
+      ],
+      "best": 0.7420545700886073,
+      "best_epoch": 0,
+      "mean": 0.7420545700886073,
+      "minutes": 0.4
+    },
+    "proximity": {
+      "aucs": [
+        0.7901053939644366
+      ],
+      "best": 0.7901053939644366,
+      "best_epoch": 0,
+      "mean": 0.7901053939644366,
+      "minutes": 1.0
+    }
+  },
+  "meta": {
+    "epochs": 1,
+    "batch_size": 512,
+    "seg_len": 24,
+    "seg_stride": 12,
+    "seed": 42,
+    "max_vehicles": 2,
+    "kv": 6,
+    "device": "cuda",
+    "gpu": "NVIDIA GeForce RTX 5080"
+  }
+}

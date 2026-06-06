@@ -43,6 +43,17 @@ def _add_ctx_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--shuffled_context", action="store_true",
                         help="negative-control ablation: permute C across "
                              "segments at training time")
+    parser.add_argument("--context_mode", choices=["proximity", "vehicle"],
+                        default="proximity",
+                        help="proximity = per-class [1/d_min,count]; "
+                             "vehicle = oriented car-skeleton matrix")
+    parser.add_argument("--film_cov", action="store_true",
+                        help="add a FiLM head that modulates the covariance "
+                             "from the context (contextual covariance penalty)")
+    parser.add_argument("--max_vehicles", type=int, default=2,
+                        help="vehicle mode: number of nearest hazards kept (M)")
+    parser.add_argument("--kv", type=int, default=6,
+                        help="vehicle mode: keypoints per vehicle")
 
 
 def _build_loaders(args, spec: ContextSpec):
@@ -90,14 +101,18 @@ def main() -> None:
     args, _model_args = init_sub_args(args)
     args.ckpt_dir = create_exp_dirs(args.exp_dir, dirmap=args.dataset)
 
-    spec = ContextSpec()
+    spec = ContextSpec(mode=args.context_mode,
+                       max_vehicles=args.max_vehicles, kv=args.kv)
     n_ctx_per_segment = spec.dim * args.seg_len
     n_kp = 2 * 18 * args.seg_len
     hidden = args.n_layers * [args.expansion_factor * (n_kp - 2)]
 
     model = PartialAutoregressiveContextFC(
-        dim=n_kp, ctx_dim=n_ctx_per_segment, hidden_dims=hidden, droppout=args.droppout
+        dim=n_kp, ctx_dim=n_ctx_per_segment, hidden_dims=hidden,
+        droppout=args.droppout, film_cov=args.film_cov,
     )
+    print(f"[ccskde] context_mode={spec.mode} dim_per_frame={spec.dim} "
+          f"n_ctx={n_ctx_per_segment} film_cov={args.film_cov}")
     print(model)
     model.to(args.device)
 
